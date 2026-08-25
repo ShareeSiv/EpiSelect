@@ -1,0 +1,44 @@
+defaults:
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+  - _self_
+
+# Checkpoint directories
+runs:
+  - label: Natural
+    path: /path/to/checkpoints/124M/Natural
+  - label: ADO
+    path: /path/to/checkpoints/124M/ADO
+  - label: EpiSelect
+    path: /path/to/checkpoints/124M/EpiSelect
+
+evals:
+  - val      # Common Pile held-out split
+  - c4       # out-of-distribution token stream
+  - harness
+
+harness_tasks:
+  - arc_challenge
+  - arc_easy
+  - bbq
+  - boolq
+  - commonsense_qa
+  - hellaswag
+  - lambada_openai
+  - openbookqa
+  - piqa
+  - sciq
+  - winogrande
+
+batch_size: 32          # harness batch size
+ood_batch_size: 8       # c4 / slim_pajama / fine_web batch size
+harness_limit: null     # cap examples per harness task, null = all
+
+data_dir: /path/to/commonpile_tfds
+ood_cache_dir: /path/to/ood_token_cache
+output: eval_results.json
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .

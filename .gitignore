@@ -1,0 +1,25 @@
+# Credentials — never commit
+.wandbkey
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Runs and artifacts
+outputs/
+wandb/
+logs/
+*.out
+eval_results.json
+
+# Local data and checkpoints
+data/
+*_tfds/
+checkpoints/

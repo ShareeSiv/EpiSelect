@@ -1,0 +1,5 @@
+# @package _global_
+defaults:
+  - override /model: xl
+  - override /loader: commonpile_ado
+seed: 0
