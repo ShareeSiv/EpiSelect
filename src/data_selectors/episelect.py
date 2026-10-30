@@ -22,6 +22,11 @@ class EpiSelect(AdoSelector):
         window_length,
         polyorder,
         tau,
+        fit_max_frac=1.0,
+        fit_max_step=None,
+        gamma_l1=0.0,
+        gamma_smooth=0.0,
+        gamma_identity=False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -33,9 +38,15 @@ class EpiSelect(AdoSelector):
         self.window_length = window_length
         self.polyorder = polyorder
         self.tau = tau
+        self.fit_max_frac = fit_max_frac  # fit only the first fraction of points (e.g. before lr decay)
+        self.fit_max_step = fit_max_step  # only fit steps below this (end of the lr stable phase)
+        self.gamma_l1 = gamma_l1  # l1 penalty on off-diagonal weights in the inner regression
+        self.gamma_smooth = gamma_smooth  # ema weight on the previous refit's gamma, in [0,1)
+        self.gamma_identity = gamma_identity  # ablation: ignore transfer, gamma = I
 
         self.fit_val = None
-        self.fit_iters = None
+        self.gamma_spread = None
+        self.fit_cond = None
 
     def curr_dist(self, itr):
         if itr < self.start_step or self.current_params is None:
@@ -62,7 +73,8 @@ class EpiSelect(AdoSelector):
     def _log_param_metrics(self, metrics):
         K = self.k
         metrics["fit_val"] = float(self.fit_val)
-        metrics["fit_iters"] = float(self.fit_iters)
+        metrics["gamma_spread"] = float(self.gamma_spread)
+        metrics["fit_cond"] = float(self.fit_cond)
         gamma_KxK, alpha_K, beta_K, irred_K = readout_params(self.current_params, K)
         for i in range(K):
             metrics[f"param_alpha/task{i}"] = float(alpha_K[i])
@@ -74,15 +86,25 @@ class EpiSelect(AdoSelector):
 
     def compute_scaling_law_params(self):
         cum_cnt_TxK = np.cumsum(self.task_cnt_TxK, axis=0)
+        task_loss_TxK = self.task_loss_TxK
+        if self.fit_max_step is not None:
+            cum_cnt_TxK, task_loss_TxK = cum_cnt_TxK[: self.fit_max_step], task_loss_TxK[: self.fit_max_step]
         if self.y_axis == "train_loss":
             cum_cnt_KxT = jnp.asarray(cum_cnt_TxK[self.ignore_steps :: self.fit_freq].T)
             # per-step training loss is noisy; smooth before fitting
-            task_loss_KxT = savgol_filter(self.task_loss_TxK.T, self.window_length, self.polyorder, axis=-1)
+            task_loss_KxT = savgol_filter(task_loss_TxK.T, self.window_length, self.polyorder, axis=-1)
             task_loss_KxT = jnp.asarray(task_loss_KxT[:, self.ignore_steps :: self.fit_freq])
         else:
             mask = self.val_step_S >= self.ignore_steps
+            if self.fit_max_step is not None:
+                mask = mask & (self.val_step_S < self.fit_max_step)
             cum_cnt_KxT = jnp.asarray(cum_cnt_TxK[self.val_step_S[mask], :].T)
             task_loss_KxT = jnp.asarray(self.val_loss_SxK[mask].T)
+        T = max(2, int(np.ceil(self.fit_max_frac * cum_cnt_KxT.shape[-1])))
+        cum_cnt_KxT, task_loss_KxT = cum_cnt_KxT[:, :T], task_loss_KxT[:, :T]
+        # columns of N must move independently for gamma to be identified; log how bad it is
+        cols = np.asarray(cum_cnt_KxT, dtype=np.float64).T
+        self.fit_cond = np.linalg.cond(cols / np.maximum(cols.max(axis=0), 1.0))
         cum_cnt_KxT, task_loss_KxT = multihost_utils.broadcast_one_to_all((cum_cnt_KxT, task_loss_KxT))
 
         sharding = jax.sharding.NamedSharding(self.mesh, P())
@@ -90,11 +112,21 @@ class EpiSelect(AdoSelector):
         task_loss_KxT = self._make_global_array(task_loss_KxT, sharding)
 
         params_Kx3pK, state = self._fit_scaling_law_fn()(cum_cnt_KxT, task_loss_KxT)
-        self.fit_val, self.fit_iters = state[0], state[1]
-        return multihost_utils.process_allgather(params_Kx3pK, tiled=True)
+        self.fit_val, self.gamma_spread = state[0], state[1]
+        params = np.array(multihost_utils.process_allgather(params_Kx3pK, tiled=True))
+        K2 = self.k * self.k
+        log_gamma = params[:K2].reshape(self.k, self.k)
+        if self.gamma_identity:
+            log_gamma = np.where(np.eye(self.k, dtype=bool), 0.0, np.log(1e-12))
+        elif self.gamma_smooth > 0 and self.current_params is not None:
+            prev = np.exp(np.asarray(self.current_params)[:K2].reshape(self.k, self.k))
+            new = self.gamma_smooth * prev + (1 - self.gamma_smooth) * np.exp(log_gamma)
+            log_gamma = np.log(np.maximum(new, 1e-12))
+        params[:K2] = log_gamma.reshape(-1)
+        return params
 
     def _fit_scaling_law_fn(self):
-        return functools.partial(fit_scaling_law, mesh=self.mesh, K=self.k)
+        return functools.partial(fit_scaling_law, mesh=self.mesh, K=self.k, l1=self.gamma_l1)
 
     def _get_S_grads(self, D, current_params):
         return jnp.exp(epiplexity_grads(D, current_params) / self.tau)

@@ -18,6 +18,8 @@ weight_decay: 1e-4
 warmup_steps: 500
 lr_decay_steps: 60000
 max_steps: 60000
+lr_schedule: cosine  # cosine | wsd (warmup-stable-decay)
+wsd_decay_frac: 0.2  # wsd: fraction of max_steps spent decaying at the end
 
 batch_size: 256  # global across all devices
 block_size: 1024

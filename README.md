@@ -61,3 +61,7 @@ python -m src.eval output=eval_results.json
   url     = {https://arxiv.org/abs/2608.11746},
 }
 ```
+
+## Scaling-law fit (own-weight-1 variant)
+
+The law is `L_m = eps_m + beta_m (n_m + sum_{k!=m} gamma_mk n_k)^(-alpha_m)`: `gamma_mm = 1` and the off-diagonal weights are free and non-negative. For a fixed `(alpha_m, eps_m)` the transformed loss `(L_m - eps_m)^(-1/alpha_m)` is linear in the token counts, so `src/scaling_law.py` solves a weighted non-negative least squares exactly and grid-searches `(alpha, eps)` outside it (with `eps < min L_m`). `gamma_spread` and `fit_cond` are logged to check that gamma is identified; `gamma_l1`, `gamma_smooth`, `gamma_identity` (ablation) and `fit_max_frac` are in `configs/loader/commonpile_episelect.yaml`.
