@@ -6,6 +6,8 @@ import numpy as np
 from jax import jit, vmap
 from jax.nn import logsumexp
 
+from src.nnls_utils import nnls
+
 
 def huber_loss(y_hat, y, delta=1e-3):
     abs_diff = jnp.abs(y - y_hat)
@@ -49,22 +51,7 @@ def epiplexity_grads(tokens, params):
     return np.sum((num / denom) * dS, axis=0)  # [K,]
 
 
-def _nnls(A, b, l1_K, iters):
-    # min 0.5 |A w - b|^2 + l1_K . w  s.t. w >= 0, by FISTA on the normal equations. convex, init-independent
-    G, h = A.T @ A, A.T @ b
-    lip = jnp.linalg.eigvalsh(G)[-1] + 1e-12
-
-    def body(_, carry):
-        w, v, t = carry
-        w_new = jnp.maximum(v - (G @ v - h + l1_K) / lip, 0.0)
-        t_new = 0.5 * (1.0 + jnp.sqrt(1.0 + 4.0 * t**2))
-        return w_new, w_new + (t - 1.0) / t_new * (w_new - w), t_new
-
-    w0 = jnp.zeros_like(h)
-    return jax.lax.fori_loop(0, iters, body, (w0, w0, 1.0))[0]
-
-
-def _nnls_gamma(Dn, colscale, L_m, m, alpha, eps, l1, iters):
+def _nnls_gamma(Dn, colscale, L_m, m, alpha, eps, l1, active=True):
     # gamma step: with (alpha, eps) fixed, y = (L-eps)^(-1/alpha) is linear in the token counts with
     # coefficients w_mk = beta^(-1/alpha) gamma_mk, so gamma = w / w_mm comes from one convex weighted NNLS.
     # Dn: [T,K] column-normalised tokens, L_m: [T,]
@@ -78,7 +65,9 @@ def _nnls_gamma(Dn, colscale, L_m, m, alpha, eps, l1, iters):
     A = jnp.exp(log_s - shift)[:, None] * Dn
     b = jnp.exp(log_sy - shift)
 
-    w = _nnls(A, b, l1 * (jnp.arange(K) != m), iters) / colscale  # [K,] in token units
+    w = (
+        nnls(A, b, c=l1 * (jnp.arange(K) != m), active=active) / colscale
+    )  # [K,] in token units, exact solve on the host
     return w / jnp.maximum(w[m], 1e-30), w[m] > 0
 
 
@@ -103,19 +92,40 @@ def _score(D_T, L_m, gamma, alpha, eps, beta):
     return jnp.where(jnp.isfinite(s), s, jnp.inf)
 
 
-def _fit_alpha(D_T, Dn, colscale, L_m, m, alpha, l1, n_alt, iters):
-    # for one alpha: alternate exact OLS for (eps, beta) and NNLS for gamma, starting from gamma = I
+def _fit_alpha(D_T, Dn, colscale, L_m, m, alpha, l1, max_alt, alt_tol):
+    # for one alpha: alternate exact OLS for (eps, beta) and NNLS for gamma, starting from gamma = I.
+    # the gamma step does not depend on beta, so one round is a scalar map eps -> F(eps) and the alternation is
+    # a fixed-point iteration on eps. plain iteration converges slowly, so it is accelerated with steffensen
+    # (aitken) steps, falling back to the plain iterate when the extrapolation is unusable.
+    # stops when eps moves by <= alt_tol * eps_max, or after max_alt steps (2 rounds each)
     K = D_T.shape[-1]
     eps_max = L_m.min() * (1.0 - 1e-3)  # keep eps safely below every observed loss
 
-    def body(_, carry):
-        gamma, _, _ = carry
-        eps, beta = _ols_eps_beta(D_T @ gamma, L_m, alpha, eps_max)
-        new_gamma, ok = _nnls_gamma(Dn, colscale, L_m, m, alpha, eps, l1, iters)
-        return jnp.where(ok, new_gamma, gamma), eps, beta
+    def F(eps, gamma, active=True):
+        new_gamma, ok = _nnls_gamma(Dn, colscale, L_m, m, alpha, eps, l1, active)
+        new_gamma = jnp.where(ok, new_gamma, gamma)
+        return _ols_eps_beta(D_T @ new_gamma, L_m, alpha, eps_max)[0], new_gamma
+
+    def cond(carry):
+        _, _, it, change = carry
+        return (it < max_alt) & (change > alt_tol * eps_max)
+
+    def body(carry):
+        # under vmap every problem runs this body until the slowest converges; only active ones are solved
+        e0, gamma, it, _ = carry
+        active = cond(carry)
+        e1, gamma = F(e0, gamma, active)
+        e2, gamma = F(e1, gamma, active)
+        denom = e2 - 2.0 * e1 + e0
+        e_acc = e0 - (e1 - e0) ** 2 / jnp.where(denom == 0, 1.0, denom)
+        usable = (jnp.abs(denom) > 1e-12 * eps_max) & jnp.isfinite(e_acc)
+        e_new = jnp.clip(jnp.where(usable, e_acc, e2), 0.0, eps_max)
+        return e_new, gamma, it + 1, jnp.abs(e_new - e0)
 
     gamma0 = (jnp.arange(K) == m).astype(L_m.dtype)
-    gamma, _, _ = jax.lax.fori_loop(0, n_alt, body, (gamma0, 0.0, 1.0))
+    eps0 = _ols_eps_beta(D_T @ gamma0, L_m, alpha, eps_max)[0]
+    eps, gamma, _, _ = jax.lax.while_loop(cond, body, (eps0, gamma0, 0, jnp.array(jnp.inf, L_m.dtype)))
+    gamma = F(eps, gamma)[1]  # gamma for the converged eps
     eps, beta = _ols_eps_beta(D_T @ gamma, L_m, alpha, eps_max)  # final (eps, beta) for the final gamma
     return _score(D_T, L_m, gamma, alpha, eps, beta), gamma, eps, beta
 
@@ -156,7 +166,7 @@ def _lm_polish(D_T, L_m, m, gamma, alpha, eps, beta, fix_alpha, alpha_bounds, it
     return p[:K], p[K + 1], p[K + 2], jnp.exp(p[K])
 
 
-@partial(jit, static_argnames=("mesh", "K", "n_alpha", "shared_alpha", "n_alt", "iters", "lm_iters"))
+@partial(jit, static_argnames=("mesh", "K", "n_alpha", "shared_alpha", "max_alt", "lm_iters"))
 def fit_scaling_law(
     D,
     L,
@@ -167,8 +177,8 @@ def fit_scaling_law(
     alpha_hi=None,
     n_alpha=31,
     shared_alpha=False,
-    n_alt=5,
-    iters=500,
+    max_alt=50,
+    alt_tol=1e-6,
     lm_iters=50,
 ):
     # D, L: [K,T]. split the problem by how each parameter enters the law:
@@ -189,7 +199,7 @@ def fit_scaling_law(
 
     fit_grid = vmap(_fit_alpha, in_axes=(None, None, None, None, None, 0, None, None, None))
     scores_KxA, gamma_KxAxK, eps_KxA, beta_KxA = vmap(
-        lambda L_m, m, alphas: fit_grid(D_T, Dn, colscale, L_m, m, alphas, l1, n_alt, iters)
+        lambda L_m, m, alphas: fit_grid(D_T, Dn, colscale, L_m, m, alphas, l1, max_alt, alt_tol)
     )(L, jnp.arange(K), alphas_KxA)
 
     if shared_alpha:

@@ -136,3 +136,20 @@ def test_shared_alpha_and_narrowed_range():
     theta, _ = fit_scaling_law(jnp.asarray(D), jnp.asarray(L), None, K=K, alpha_lo=lo, alpha_hi=hi)
     _, a, _, _ = readout_params(theta, K)
     assert (a >= 0.2 - 1e-6).all() and (a <= 0.3 + 1e-6).all()
+
+
+def test_fit_recovers_31_domains():
+    # 31 domains with single-domain bursts: the alternation must run to convergence to recover the transfer weights
+    rng = np.random.default_rng(0)
+    K, T = 31, 400
+    steps = np.full((T, K), 1e2)
+    for start in range(0, T, 5):
+        steps[start : start + 5, rng.integers(K)] += 1e4
+    D = (np.cumsum(steps, 0).T + 1e3).astype(np.float32)
+    gamma = np.eye(K)
+    gamma[0, 1], gamma[2, 3], gamma[5, 9] = 0.4, 0.2, 0.3
+    L = (1.7 + 5 * (gamma @ D) ** -0.3).astype(np.float32)
+    theta, _ = fit_scaling_law(jnp.asarray(D), jnp.asarray(L), None, K=K)
+    g, a, _, e = readout_params(theta, K)
+    assert np.abs(g - gamma).max() < 1e-2
+    assert np.abs(a - 0.3).max() < 1e-2 and np.abs(e - 1.7).max() < 1e-2
