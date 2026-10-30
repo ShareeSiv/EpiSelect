@@ -72,6 +72,11 @@ class AdaptiveLoader(Loader):
         gamma_l1: float = 0.0,
         gamma_smooth: float = 0.0,
         gamma_identity: bool = False,
+        shared_alpha: bool = False,
+        alpha_range: tp.Sequence[float] = (0.05, 0.8),
+        alpha_shrink: float = 0.7,
+        alpha_min_halfwidth: float = 0.05,
+        fit_data_path: tp.Optional[str] = None,
         mode: str = "empirical",  # empirical | uniform
         policy_type: str = "episelect",
         y_axis: str = "train_loss",  # train_loss | val_loss
@@ -124,6 +129,11 @@ class AdaptiveLoader(Loader):
                 gamma_l1=gamma_l1,
                 gamma_smooth=gamma_smooth,
                 gamma_identity=gamma_identity,
+                shared_alpha=shared_alpha,
+                alpha_range=tuple(alpha_range),
+                alpha_shrink=alpha_shrink,
+                alpha_min_halfwidth=alpha_min_halfwidth,
+                fit_data_path=fit_data_path,
             )
         if policy_type not in SELECTORS:
             raise ValueError(f"Unrecognized policy_type: {policy_type}. Options: {sorted(SELECTORS)}")

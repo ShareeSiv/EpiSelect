@@ -64,4 +64,19 @@ python -m src.eval output=eval_results.json
 
 ## Scaling-law fit (own-weight-1 variant)
 
-The law is `L_m = eps_m + beta_m (n_m + sum_{k!=m} gamma_mk n_k)^(-alpha_m)`: `gamma_mm = 1` and the off-diagonal weights are free and non-negative. For a fixed `(alpha_m, eps_m)` the transformed loss `(L_m - eps_m)^(-1/alpha_m)` is linear in the token counts, so `src/scaling_law.py` solves a weighted non-negative least squares exactly and grid-searches `(alpha, eps)` outside it (with `eps < min L_m`). `gamma_spread` and `fit_cond` are logged to check that gamma is identified; `gamma_l1`, `gamma_smooth`, `gamma_identity` (ablation) and `fit_max_frac` are in `configs/loader/commonpile_episelect.yaml`.
+The law is `L_m = eps_m + beta_m * z_m^(-alpha_m)` with `z_m = n_m + sum_{k!=m} gamma_mk n_k`: `gamma_mm = 1` and the off-diagonal weights are free and non-negative. `src/scaling_law.py` splits the fit by how each parameter enters the law:
+
+| Parameter | How it is fit |
+|---|---|
+| `gamma_mk` | weighted NNLS of `(L_m - eps_m)^(-1/alpha_m)` on the token counts: convex, one answer |
+| `eps_m`, `beta_m` | OLS of `L_m` on `z_m^(-alpha_m)`: exact, with `eps_m < min L_m` |
+| `alpha_m` | 1-d grid search, per domain or one shared alpha (`shared_alpha`) |
+| all of them | projected Levenberg-Marquardt polish in log-loss space, kept only if it does not worsen the Huber score |
+
+For each alpha, the (eps, beta) and gamma steps alternate from `gamma = I`. Every refit narrows each domain's alpha range around its previous alpha (`alpha_range`, `alpha_shrink`, `alpha_min_halfwidth`) and can smooth gamma across refits (`gamma_smooth`). `gamma_spread` and `fit_cond` are logged to check that gamma is identified; `gamma_l1`, `gamma_identity` (ablation), `fit_max_frac`/`fit_max_step`, the `lr_schedule: wsd` option and the early `explore_steps` phase are in the configs.
+
+For uncertainty on gamma, set `fit_data_path` to dump each refit's `(D, L)` and run the same model with full Bayes (NUTS, needs `pip install -e .[bayes]`):
+
+```bash
+python scripts/fit_scaling_law_bayes.py fit_data_60000.npz --out posterior.npz
+```

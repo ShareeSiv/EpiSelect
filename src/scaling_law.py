@@ -64,9 +64,10 @@ def _nnls(A, b, l1_K, iters):
     return jax.lax.fori_loop(0, iters, body, (w0, w0, 1.0))[0]
 
 
-def _fit_pair(Dn, L_m, m, alpha, eps, l1, iters):
-    # Dn: [T,K] column-normalised tokens, L_m: [T,]. fixed (alpha, eps) => linear regression of
-    # y = (L-eps)^(-1/alpha) on the token counts, with coefficients w_mk = beta^(-1/alpha) gamma_mk.
+def _nnls_gamma(Dn, colscale, L_m, m, alpha, eps, l1, iters):
+    # gamma step: with (alpha, eps) fixed, y = (L-eps)^(-1/alpha) is linear in the token counts with
+    # coefficients w_mk = beta^(-1/alpha) gamma_mk, so gamma = w / w_mm comes from one convex weighted NNLS.
+    # Dn: [T,K] column-normalised tokens, L_m: [T,]
     K = Dn.shape[-1]
     d = L_m - eps
     # delta-method weights: noise on L becomes |dy/dL| times larger on y, so rows get s = 1/|dy/dL| / L.
@@ -77,46 +78,145 @@ def _fit_pair(Dn, L_m, m, alpha, eps, l1, iters):
     A = jnp.exp(log_s - shift)[:, None] * Dn
     b = jnp.exp(log_sy - shift)
 
-    l1_K = l1 * (jnp.arange(K) != m)
-    w = _nnls(A, b, l1_K, iters)  # normalised coefficients [K,]
-
-    z = jnp.maximum(Dn @ w, 1e-30)
-    log_L_hat = jnp.log(eps + z ** (-alpha))
-    score = jnp.sum(huber_loss(log_L_hat, jnp.log(L_m), delta=1e-3))
-    valid = (w[m] > 0) & jnp.isfinite(score)
-    return jnp.where(valid, score, jnp.inf), w
+    w = _nnls(A, b, l1 * (jnp.arange(K) != m), iters) / colscale  # [K,] in token units
+    return w / jnp.maximum(w[m], 1e-30), w[m] > 0
 
 
-@partial(jit, static_argnames=("mesh", "K", "n_alpha", "n_eps", "iters"))
-def fit_scaling_law(D, L, mesh, K, l1=0.0, n_alpha=31, n_eps=60, iters=500):
-    # D, L: [K,T]. per domain: grid over (alpha, eps) outside, exact weighted NNLS for gamma inside.
-    # eps = f * min(L) with f < 1, so L - eps > 0 at every point (f = 0 is the eps = 0 end of the grid)
+def _ols_eps_beta(z, L_m, alpha, eps_max):
+    # (eps, beta) step: with gamma and alpha fixed, L = eps + beta * z^(-alpha) is linear in (eps, beta).
+    # exact 2x2 least squares, then clip eps into [0, eps_max] and refit beta if the clip was active
+    x = z ** (-alpha)
+    xc, Lc = x - x.mean(), L_m - L_m.mean()
+    beta = jnp.sum(xc * Lc) / jnp.maximum(jnp.sum(xc**2), 1e-30)
+    eps = jnp.clip(L_m.mean() - beta * x.mean(), 0.0, eps_max)
+    beta = jnp.maximum(jnp.sum(x * (L_m - eps)) / jnp.maximum(jnp.sum(x**2), 1e-30), 1e-12)
+    return eps, beta
+
+
+def _log_pred(D_T, gamma, alpha, eps, beta):
+    z = jnp.maximum(D_T @ gamma, 1e-30)
+    return jnp.log(eps + beta * z ** (-alpha))
+
+
+def _score(D_T, L_m, gamma, alpha, eps, beta):
+    s = jnp.sum(huber_loss(_log_pred(D_T, gamma, alpha, eps, beta), jnp.log(L_m), delta=1e-3))
+    return jnp.where(jnp.isfinite(s), s, jnp.inf)
+
+
+def _fit_alpha(D_T, Dn, colscale, L_m, m, alpha, l1, n_alt, iters):
+    # for one alpha: alternate exact OLS for (eps, beta) and NNLS for gamma, starting from gamma = I
+    K = D_T.shape[-1]
+    eps_max = L_m.min() * (1.0 - 1e-3)  # keep eps safely below every observed loss
+
+    def body(_, carry):
+        gamma, _, _ = carry
+        eps, beta = _ols_eps_beta(D_T @ gamma, L_m, alpha, eps_max)
+        new_gamma, ok = _nnls_gamma(Dn, colscale, L_m, m, alpha, eps, l1, iters)
+        return jnp.where(ok, new_gamma, gamma), eps, beta
+
+    gamma0 = (jnp.arange(K) == m).astype(L_m.dtype)
+    gamma, _, _ = jax.lax.fori_loop(0, n_alt, body, (gamma0, 0.0, 1.0))
+    eps, beta = _ols_eps_beta(D_T @ gamma, L_m, alpha, eps_max)  # final (eps, beta) for the final gamma
+    return _score(D_T, L_m, gamma, alpha, eps, beta), gamma, eps, beta
+
+
+def _lm_polish(D_T, L_m, m, gamma, alpha, eps, beta, fix_alpha, alpha_bounds, iters):
+    # joint levenberg-marquardt on all parameters, in log-loss space, projected onto the feasible set.
+    # params: [gamma (K), log_beta, alpha, eps]; gamma_mm (and alpha, if shared) are held fixed
+    K = D_T.shape[-1]
+    log_L = jnp.log(L_m)
+    eps_max = L_m.min() * (1.0 - 1e-3)
+    free = jnp.concatenate([jnp.arange(K) != m, jnp.array([True, not fix_alpha, True])]).astype(L_m.dtype)
+
+    def resid(p):
+        return _log_pred(D_T, p[:K], p[K + 1], p[K + 2], jnp.exp(p[K])) - log_L
+
+    def project(p):
+        p = p.at[:K].set(jnp.maximum(p[:K], 0.0))
+        p = p.at[K + 1].set(jnp.clip(p[K + 1], *alpha_bounds))
+        return p.at[K + 2].set(jnp.clip(p[K + 2], 0.0, eps_max))
+
+    def cost(p):
+        c = jnp.sum(resid(p) ** 2)
+        return jnp.where(jnp.isfinite(c), c, jnp.inf)
+
+    def body(_, carry):
+        p, lam, c = carry
+        r, J = resid(p), jax.jacfwd(resid)(p) * free[None]
+        H = J.T @ J
+        H = H + lam * jnp.diag(jnp.diag(H) + 1e-12) + (1.0 - free) * jnp.eye(p.shape[0])  # pin fixed params
+        step = jnp.linalg.solve(H, -J.T @ r) * free
+        p_new = project(p + step)
+        c_new = cost(p_new)
+        better = c_new < c
+        return jnp.where(better, p_new, p), jnp.where(better, lam / 3.0, lam * 3.0), jnp.minimum(c, c_new)
+
+    p0 = jnp.concatenate([gamma, jnp.array([jnp.log(beta), alpha, eps])])
+    p, _, _ = jax.lax.fori_loop(0, iters, body, (p0, 1e-2, cost(p0)))
+    return p[:K], p[K + 1], p[K + 2], jnp.exp(p[K])
+
+
+@partial(jit, static_argnames=("mesh", "K", "n_alpha", "shared_alpha", "n_alt", "iters", "lm_iters"))
+def fit_scaling_law(
+    D,
+    L,
+    mesh,
+    K,
+    l1=0.0,
+    alpha_lo=None,
+    alpha_hi=None,
+    n_alpha=31,
+    shared_alpha=False,
+    n_alt=5,
+    iters=500,
+    lm_iters=50,
+):
+    # D, L: [K,T]. split the problem by how each parameter enters the law:
+    #   alpha: 1-d grid search (per domain, or one alpha shared by all domains)
+    #   inside, per alpha: alternate exact OLS for (eps, beta) and weighted NNLS for gamma
+    #   then a joint levenberg-marquardt polish in log-loss space from the best grid point.
+    # alpha_lo/alpha_hi: [K,] per-domain search range, so refits can narrow it around the previous alpha
     del mesh
+    alpha_lo = jnp.full((K,), 0.05) if alpha_lo is None else alpha_lo
+    alpha_hi = jnp.full((K,), 0.8) if alpha_hi is None else alpha_hi
+    if shared_alpha:  # one grid for everyone, so scores are comparable across domains
+        alpha_lo, alpha_hi = jnp.full((K,), alpha_lo.min()), jnp.full((K,), alpha_hi.max())
+    alphas_KxA = alpha_lo[:, None] + (alpha_hi - alpha_lo)[:, None] * jnp.linspace(0.0, 1.0, n_alpha)[None]
+
+    D_T = D.T  # [T,K]
     colscale = jnp.maximum(D.max(axis=-1), 1.0)  # [K,]
-    Dn = D.T / colscale  # [T,K]
-    alphas = jnp.linspace(0.05, 0.8, n_alpha)
-    # losses plateau near eps, so resolve the gap min(L) - eps log-spaced: eps = min(L) * (1 - g), g in [1e-3, 1]
-    fracs = 1.0 - jnp.logspace(-3, 0, n_eps)[::-1]
-    A_p = jnp.repeat(alphas, n_eps)  # [P,]
-    f_p = jnp.tile(fracs, n_alpha)
+    Dn = D_T / colscale
 
-    def fit_domain(L_m, m):
-        eps_p = f_p * L_m.min()
-        scores, w = vmap(_fit_pair, in_axes=(None, None, None, 0, 0, None, None))(Dn, L_m, m, A_p, eps_p, l1, iters)
-        best = jnp.argmin(scores)
-        w_orig = w / colscale[None]  # [P,K]
-        w_mm = jnp.maximum(w_orig[:, m], 1e-30)
-        gamma_p = w_orig / w_mm[:, None]  # [P,K], gamma_mm = 1
+    fit_grid = vmap(_fit_alpha, in_axes=(None, None, None, None, None, 0, None, None, None))
+    scores_KxA, gamma_KxAxK, eps_KxA, beta_KxA = vmap(
+        lambda L_m, m, alphas: fit_grid(D_T, Dn, colscale, L_m, m, alphas, l1, n_alt, iters)
+    )(L, jnp.arange(K), alphas_KxA)
 
-        # identifiability check: how much does gamma move across pairs that fit about as well as the best?
-        near = (scores <= scores[best] * 1.1 + 1e-4)[:, None]
-        spread = jnp.where(near, gamma_p, -jnp.inf).max(0) - jnp.where(near, gamma_p, jnp.inf).min(0)
-        spread = jnp.where(jnp.arange(K) == m, 0.0, spread).max()
+    if shared_alpha:
+        best_K = jnp.full((K,), jnp.argmin(scores_KxA.sum(0)))
+    else:
+        best_K = jnp.argmin(scores_KxA, axis=-1)
+    take = lambda x: jnp.take_along_axis(x, best_K.reshape((K,) + (1,) * (x.ndim - 1)), axis=1)[:, 0]  # noqa: E731
+    gamma, eps, beta, alpha = take(gamma_KxAxK), take(eps_KxA), take(beta_KxA), take(alphas_KxA)
+    grid_score = take(scores_KxA)
 
-        log_beta = -A_p[best] * jnp.log(w_mm[best])  # beta = w_mm^(-alpha)
-        log_gamma = jnp.log(jnp.maximum(gamma_p[best], 1e-12))
-        return log_gamma, A_p[best], log_beta, jnp.log(jnp.maximum(eps_p[best], 1e-12)), scores[best], spread
+    # identifiability check: how much does gamma move across alphas that fit about as well as the best?
+    near = (scores_KxA <= grid_score[:, None] * 1.1 + 1e-4)[..., None]
+    spread = jnp.where(near, gamma_KxAxK, -jnp.inf).max(1) - jnp.where(near, gamma_KxAxK, jnp.inf).min(1)
+    spread = jnp.where(jnp.eye(K, dtype=bool), 0.0, spread).max(-1)  # [K,]
 
-    log_gamma, alpha, log_beta, log_eps, value, spread = vmap(fit_domain)(L, jnp.arange(K))
-    theta = jnp.concatenate([log_gamma.reshape(-1), alpha, log_beta, log_eps])
+    def polish(L_m, m, g, a, e, b, lo, hi):
+        g2, a2, e2, b2 = _lm_polish(D_T, L_m, m, g, a, e, b, shared_alpha, (lo, hi), lm_iters)
+        s2 = _score(D_T, L_m, g2, a2, e2, b2)
+        return s2, g2, a2, e2, b2
+
+    s2, g2, a2, e2, b2 = vmap(polish)(L, jnp.arange(K), gamma, alpha, eps, beta, alpha_lo, alpha_hi)
+    # lm minimises squared error, the grid minimises huber; keep the polish only where it did not hurt
+    keep = s2 <= grid_score
+    pick = lambda new, old: jnp.where(keep.reshape((K,) + (1,) * (old.ndim - 1)), new, old)  # noqa: E731
+    gamma, alpha, eps, beta = pick(g2, gamma), pick(a2, alpha), pick(e2, eps), pick(b2, beta)
+    value = jnp.where(keep, s2, grid_score)
+
+    log_gamma = jnp.log(jnp.maximum(gamma, 1e-12))
+    theta = jnp.concatenate([log_gamma.reshape(-1), alpha, jnp.log(beta), jnp.log(jnp.maximum(eps, 1e-12))])
     return theta, (jnp.sum(value), jnp.mean(spread))

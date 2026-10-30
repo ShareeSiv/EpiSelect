@@ -1,5 +1,6 @@
 import functools
 
+import gcsfs
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -27,6 +28,11 @@ class EpiSelect(AdoSelector):
         gamma_l1=0.0,
         gamma_smooth=0.0,
         gamma_identity=False,
+        shared_alpha=False,
+        alpha_range=(0.05, 0.8),
+        alpha_shrink=0.7,
+        alpha_min_halfwidth=0.05,
+        fit_data_path=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -43,6 +49,13 @@ class EpiSelect(AdoSelector):
         self.gamma_l1 = gamma_l1  # l1 penalty on off-diagonal weights in the inner regression
         self.gamma_smooth = gamma_smooth  # ema weight on the previous refit's gamma, in [0,1)
         self.gamma_identity = gamma_identity  # ablation: ignore transfer, gamma = I
+        self.shared_alpha = shared_alpha  # one alpha for all domains
+        # per-domain alpha search range; each refit narrows it around the last alpha by alpha_shrink
+        self.alpha_lo = np.full(self.k, float(alpha_range[0]))
+        self.alpha_hi = np.full(self.k, float(alpha_range[1]))
+        self.alpha_shrink = alpha_shrink
+        self.alpha_min_halfwidth = alpha_min_halfwidth
+        self.fit_data_path = fit_data_path  # if set, dump each refit's (D, L) for offline (bayesian) fits
 
         self.fit_val = None
         self.gamma_spread = None
@@ -75,6 +88,7 @@ class EpiSelect(AdoSelector):
         metrics["fit_val"] = float(self.fit_val)
         metrics["gamma_spread"] = float(self.gamma_spread)
         metrics["fit_cond"] = float(self.fit_cond)
+        metrics["alpha_range_width"] = float(np.mean(self.alpha_hi - self.alpha_lo))
         gamma_KxK, alpha_K, beta_K, irred_K = readout_params(self.current_params, K)
         for i in range(K):
             metrics[f"param_alpha/task{i}"] = float(alpha_K[i])
@@ -106,6 +120,8 @@ class EpiSelect(AdoSelector):
         cols = np.asarray(cum_cnt_KxT, dtype=np.float64).T
         self.fit_cond = np.linalg.cond(cols / np.maximum(cols.max(axis=0), 1.0))
         cum_cnt_KxT, task_loss_KxT = multihost_utils.broadcast_one_to_all((cum_cnt_KxT, task_loss_KxT))
+        if self.fit_data_path and jax.process_index() == 0:
+            self._dump_fit_data(np.asarray(cum_cnt_KxT), np.asarray(task_loss_KxT))
 
         sharding = jax.sharding.NamedSharding(self.mesh, P())
         cum_cnt_KxT = self._make_global_array(cum_cnt_KxT, sharding)
@@ -123,10 +139,33 @@ class EpiSelect(AdoSelector):
             new = self.gamma_smooth * prev + (1 - self.gamma_smooth) * np.exp(log_gamma)
             log_gamma = np.log(np.maximum(new, 1e-12))
         params[:K2] = log_gamma.reshape(-1)
+        self._narrow_alpha_range(params[K2 : K2 + self.k])
         return params
 
+    def _narrow_alpha_range(self, alpha_K):
+        if not np.isfinite(alpha_K).all():
+            return
+        half = np.maximum(self.alpha_shrink * (self.alpha_hi - self.alpha_lo) / 2, self.alpha_min_halfwidth)
+        self.alpha_lo = np.clip(alpha_K - half, 0.01, None)
+        self.alpha_hi = np.clip(alpha_K + half, None, 1.0)
+
+    def _dump_fit_data(self, cum_cnt_KxT, task_loss_KxT):
+        # path may contain {step}, e.g. gs://bucket/run/fit_data_{step}.npz
+        path = self.fit_data_path.format(step=self.task_cnt_TxK.shape[0])
+        opener = gcsfs.GCSFileSystem().open if path.startswith("gs://") else open
+        with opener(path, "wb") as f:
+            np.savez(f, D=cum_cnt_KxT, L=task_loss_KxT)
+
     def _fit_scaling_law_fn(self):
-        return functools.partial(fit_scaling_law, mesh=self.mesh, K=self.k, l1=self.gamma_l1)
+        return functools.partial(
+            fit_scaling_law,
+            mesh=self.mesh,
+            K=self.k,
+            l1=self.gamma_l1,
+            alpha_lo=jnp.asarray(self.alpha_lo, dtype=jnp.float32),
+            alpha_hi=jnp.asarray(self.alpha_hi, dtype=jnp.float32),
+            shared_alpha=self.shared_alpha,
+        )
 
     def _get_S_grads(self, D, current_params):
         return jnp.exp(epiplexity_grads(D, current_params) / self.tau)

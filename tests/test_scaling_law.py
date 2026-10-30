@@ -4,7 +4,7 @@ import jax.random as jr
 import numpy as np
 from jax.sharding import Mesh
 
-from src.scaling_law import epiplexity_grads, fit_scaling_law, readout_params
+from src.scaling_law import _score, epiplexity_grads, fit_scaling_law, readout_params
 
 
 def np_loss(gamma, alpha, beta, eps, x):
@@ -110,3 +110,29 @@ def test_fit_never_nan_with_eps_grid_near_loss():
     D, L, *_ = _synthetic(noise=0.01)
     theta, _ = fit_scaling_law(jnp.asarray(D), jnp.asarray(L), mesh, K=D.shape[0])
     assert np.isfinite(np.asarray(theta)).all()
+
+
+def test_fit_matches_true_params_under_noise():
+    # with noise gamma need not be recovered, but the optimiser should fit at least as well as the truth
+    D, L, gamma, alpha, eps = _synthetic(noise=0.01)
+    beta = np.array([5.0, 4.0, 6.0, 3.0])
+    theta, _ = fit_scaling_law(jnp.asarray(D), jnp.asarray(L), None, K=D.shape[0])
+    g, a, b, e = readout_params(theta, D.shape[0])
+    for m in range(D.shape[0]):
+        true = float(
+            _score(jnp.asarray(D.T), jnp.asarray(L[m]), jnp.asarray(gamma[m], jnp.float32), alpha[m], eps[m], beta[m])
+        )
+        fit = float(_score(jnp.asarray(D.T), jnp.asarray(L[m]), jnp.asarray(g[m]), a[m], e[m], b[m]))
+        assert fit <= true * 1.05
+
+
+def test_shared_alpha_and_narrowed_range():
+    D, L, *_ = _synthetic()
+    K = D.shape[0]
+    theta, _ = fit_scaling_law(jnp.asarray(D), jnp.asarray(L), None, K=K, shared_alpha=True)
+    _, a, _, _ = readout_params(theta, K)
+    assert np.allclose(a, a[0])
+    lo, hi = jnp.full((K,), 0.2), jnp.full((K,), 0.3)
+    theta, _ = fit_scaling_law(jnp.asarray(D), jnp.asarray(L), None, K=K, alpha_lo=lo, alpha_hi=hi)
+    _, a, _, _ = readout_params(theta, K)
+    assert (a >= 0.2 - 1e-6).all() and (a <= 0.3 + 1e-6).all()
