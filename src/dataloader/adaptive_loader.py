@@ -77,6 +77,7 @@ class AdaptiveLoader(Loader):
         alpha_shrink: float = 0.7,
         alpha_min_halfwidth: float = 0.05,
         fit_data_path: tp.Optional[str] = None,
+        fit_method: str = "own",  # own | paper
         mode: str = "empirical",  # empirical | uniform
         policy_type: str = "episelect",
         y_axis: str = "train_loss",  # train_loss | val_loss
@@ -134,6 +135,7 @@ class AdaptiveLoader(Loader):
                 alpha_shrink=alpha_shrink,
                 alpha_min_halfwidth=alpha_min_halfwidth,
                 fit_data_path=fit_data_path,
+                fit_method=fit_method,
             )
         if policy_type not in SELECTORS:
             raise ValueError(f"Unrecognized policy_type: {policy_type}. Options: {sorted(SELECTORS)}")

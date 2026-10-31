@@ -1,0 +1,6 @@
+# mlx_episelect with the paper's original joint fit; everything else (exploration, refits, fit window) is shared
+defaults:
+  - mlx_episelect
+  - _self_
+
+fit_method: paper

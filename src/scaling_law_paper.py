@@ -1,0 +1,126 @@
+# the paper's original fit (commit c45889c), kept for comparison with the own-weight-1 fit in src/scaling_law.py.
+# each row of gamma lies on the simplex (softmax of log_gamma), and all of theta is fit jointly with LBFGS on a
+# huber loss in log space, from a grid of 729 inits. theta has the same layout as in src/scaling_law.py
+from functools import partial
+
+import jax
+import jax.numpy as jnp
+import jax.random as jr
+import numpy as np
+from jax import jit, vmap
+from jax.nn import logsumexp
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
+from jaxopt import LBFGS
+
+from src.scaling_law import huber_loss
+
+
+def sample_tilted_simplex(key, K, num_samples, tilt):
+    # dirichlet init
+    keys = jr.split(key, K)
+    all_gammas = []
+    for i in range(K):
+        alpha = jnp.ones(K).at[i].set(tilt)
+        all_gammas.append(jr.dirichlet(keys[i], alpha, shape=(num_samples,)))
+    return jnp.stack(all_gammas, axis=0)  # [K,G,K]
+
+
+def construct_sparse_inits(key, K):
+    # grid over the scalars, crossed with one tilted-simplex draw for gamma:
+    #   alpha in {0.0, 0.1, ..., 0.8}, log_beta in {-2, -1, ..., 6}, log_eps in {-2.0, -1.5, ..., 2.0}
+    # 9*9*9 = 729 inits. arange excludes its stop, hence the extra step on each bound
+    log_beta = jnp.arange(-2, 7, 1)
+    log_eps = jnp.arange(-2, 2.5, 0.5)
+    alpha = jnp.arange(0, 0.9, 0.1)
+    gamma_grid_n = 1
+    gamma = sample_tilted_simplex(key, K, num_samples=gamma_grid_n, tilt=10.0)  # [K,G,K]
+
+    A, B, E = jnp.meshgrid(alpha, log_beta, log_eps, indexing="ij")
+    scalars = jnp.stack([A, B, E], axis=-1).reshape(-1, 3)  # [S,3]
+    scalars = jnp.broadcast_to(scalars[None], shape=(K,) + scalars.shape)  # [K,S,3]
+
+    scalars_tiled = jnp.tile(scalars, (1, gamma.shape[1], 1))  # [K,GS,3]
+    gamma_expanded = jnp.repeat(gamma, scalars.shape[1], axis=-2)  # [K,GS,K]
+    gamma_expanded = jnp.transpose(gamma_expanded, axes=[2, 1, 0])
+
+    init_grid = jnp.concatenate([jnp.log(gamma_expanded), scalars_tiled], axis=-1)  # [K,GS,K+3]
+    init_grid = init_grid.transpose(1, 2, 0)  # [GS,K+3,K]
+    return init_grid.reshape(init_grid.shape[0], -1)  # [GS,K(K+3)]
+
+
+def _unpack(theta, K):
+    K2 = K * K
+    log_gamma = theta[:K2].reshape(K, K)
+    log_gamma = log_gamma - logsumexp(log_gamma, axis=-1, keepdims=True)
+    return log_gamma, theta[K2 : K2 + K], theta[K2 + K : K2 + 2 * K], theta[-K:]
+
+
+def _log_loss(theta, x):
+    # theta: [K(K+3),], x: [T,K] -> [T,K]
+    log_gamma, alpha, log_beta, log_eps = _unpack(theta, K=x.shape[-1])
+    term1 = logsumexp(log_gamma[None] + jnp.log(x)[:, None], axis=-1)  # [T,K]
+    term1 = log_beta[None] - alpha[None] * term1
+    term2 = log_eps[None] * jnp.ones_like(x)
+    return logsumexp(jnp.stack([term1, term2], axis=0), axis=0)
+
+
+def _fit_objective(params, D, L):
+    # D, L: [K,T]. huber on log-loss, plus barriers keeping the fit in a sane region
+    log_L_hat = _log_loss(params, jnp.transpose(D, axes=[1, 0]))  # [T,K]
+    log_L = jnp.log(jnp.transpose(L, axes=[1, 0]))  # [T,K]
+    _, alpha, log_beta, log_eps = _unpack(params, D.shape[0])
+
+    alpha_max = jnp.sum(jnp.maximum(alpha - 0.8, 0))  # alpha <= 0.8
+    alpha_min = jnp.sum(-jnp.minimum(alpha, 0.001))  # alpha >= 0
+    log_beta_max = jnp.sum(jnp.maximum(log_beta - 6.5, 0))  # beta <= ~665
+    log_eps_min = jnp.sum(-jnp.minimum(log_eps - 0.5, 0))  # eps >= 0.5
+
+    out = jnp.sum(huber_loss(log_L, log_L_hat, delta=1e-3))
+    return out + alpha_max + alpha_min + log_beta_max + log_eps_min
+
+
+def readout_params(theta, K):
+    log_gamma, alpha, log_beta, log_eps = _unpack(theta, K=K)
+    return np.exp(log_gamma), np.array(alpha), np.exp(log_beta), np.exp(log_eps)
+
+
+def to_own_weight(theta, K):
+    # the same law with gamma_mm = 1, in src/scaling_law.py's parameterisation:
+    #   sum_k g_mk n_k = g_mm (n_m + sum_{k!=m} (g_mk / g_mm) n_k), so beta picks up g_mm^-alpha
+    log_gamma, alpha, log_beta, log_eps = _unpack(jnp.asarray(theta), K=K)
+    log_diag = jnp.diag(log_gamma)
+    log_gamma = log_gamma - log_diag[:, None]
+    return jnp.concatenate([log_gamma.reshape(-1), alpha, log_beta - alpha * log_diag, log_eps])
+
+
+def epiplexity_grads(tokens, params):
+    log_gamma, alpha, _, log_eps = _unpack(params, K=tokens.shape[0])
+    gamma = np.exp(log_gamma)  # [K,K]
+    alpha = np.array(alpha)  # [K,]
+    eps = np.exp(log_eps)  # [K,]
+    loss = np.exp(_log_loss(params, tokens.T).T)[:, 0]  # [K,]
+
+    dS = (alpha * (loss - eps))[:, None]  # [K,1]
+    num = gamma * tokens  # [K,K]
+    denom = np.sum(gamma * tokens.T, axis=-1, keepdims=True)  # [K,1]
+    return np.sum((num / denom) * dS, axis=0)  # [K,]
+
+
+@partial(jit, static_argnums=(2, 3))
+def fit_scaling_law_all(D, L, mesh, K):
+    # every init's LBFGS result, for looking at how far near-best fits disagree
+    init_grid = construct_sparse_inits(key=jr.PRNGKey(21), K=K)  # [G,K(K+3)]
+    sharding = NamedSharding(mesh, P(("replica", "data"), None))
+    init_grid = jax.lax.with_sharding_constraint(init_grid, sharding)
+
+    solver = LBFGS(_fit_objective, tol=1e-5, jit=True, maxiter=200)
+    all_theta_hats, state = vmap(solver.run, in_axes=(0, None, None))(init_grid, D, L)
+    return all_theta_hats, state.value, state.iter_num
+
+
+@partial(jit, static_argnums=(2, 3))
+def fit_scaling_law(D, L, mesh, K):
+    all_theta_hats, values, iters = fit_scaling_law_all(D, L, mesh, K)
+    min_pos = jnp.nanargmin(values)
+    return all_theta_hats[min_pos], (values[min_pos], iters[min_pos])

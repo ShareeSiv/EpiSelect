@@ -1,0 +1,7 @@
+# ~20M non-embedding params; the tied 50k-token embedding adds vocab_size x n_embd
+vocab_size: 50304
+n_layer: 12
+n_head: 6
+n_embd: 384
+dropout: 0.0
+mup: false

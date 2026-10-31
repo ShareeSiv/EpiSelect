@@ -130,13 +130,15 @@ def _fit_alpha(D_T, Dn, colscale, L_m, m, alpha, l1, max_alt, alt_tol):
     return _score(D_T, L_m, gamma, alpha, eps, beta), gamma, eps, beta
 
 
-def _lm_polish(D_T, L_m, m, gamma, alpha, eps, beta, fix_alpha, alpha_bounds, iters):
+def _lm_polish(D_T, L_m, m, gamma, alpha, eps, beta, fix_alpha, alpha_bounds, iters, keep_zeros=False):
     # joint levenberg-marquardt on all parameters, in log-loss space, projected onto the feasible set.
-    # params: [gamma (K), log_beta, alpha, eps]; gamma_mm (and alpha, if shared) are held fixed
+    # params: [gamma (K), log_beta, alpha, eps]; gamma_mm (and alpha, if shared) are held fixed.
+    # keep_zeros: also hold the weights the l1-penalised nnls set to 0, since lm ignores the penalty
     K = D_T.shape[-1]
     log_L = jnp.log(L_m)
     eps_max = L_m.min() * (1.0 - 1e-3)
-    free = jnp.concatenate([jnp.arange(K) != m, jnp.array([True, not fix_alpha, True])]).astype(L_m.dtype)
+    free_gamma = (jnp.arange(K) != m) & ~(keep_zeros & (gamma == 0))
+    free = jnp.concatenate([free_gamma, jnp.array([True, not fix_alpha, True])]).astype(L_m.dtype)
 
     def resid(p):
         return _log_pred(D_T, p[:K], p[K + 1], p[K + 2], jnp.exp(p[K])) - log_L
@@ -216,7 +218,7 @@ def fit_scaling_law(
     spread = jnp.where(jnp.eye(K, dtype=bool), 0.0, spread).max(-1)  # [K,]
 
     def polish(L_m, m, g, a, e, b, lo, hi):
-        g2, a2, e2, b2 = _lm_polish(D_T, L_m, m, g, a, e, b, shared_alpha, (lo, hi), lm_iters)
+        g2, a2, e2, b2 = _lm_polish(D_T, L_m, m, g, a, e, b, shared_alpha, (lo, hi), lm_iters, keep_zeros=l1 > 0)
         s2 = _score(D_T, L_m, g2, a2, e2, b2)
         return s2, g2, a2, e2, b2
 

@@ -1,0 +1,6 @@
+# ablation: mlx_episelect with gamma = I (no cross-domain transfer)
+defaults:
+  - mlx_episelect
+  - _self_
+
+gamma_identity: true

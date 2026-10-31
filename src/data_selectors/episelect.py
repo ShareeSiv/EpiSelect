@@ -8,6 +8,7 @@ from jax.experimental import multihost_utils
 from jax.sharding import PartitionSpec as P
 from scipy.signal import savgol_filter
 
+from src import scaling_law_paper
 from src.data_selectors.ado import AdoSelector, clip_min_probability
 from src.scaling_law import epiplexity_grads, fit_scaling_law, readout_params
 
@@ -33,6 +34,7 @@ class EpiSelect(AdoSelector):
         alpha_shrink=0.7,
         alpha_min_halfwidth=0.05,
         fit_data_path=None,
+        fit_method="own",  # own | paper
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -56,6 +58,11 @@ class EpiSelect(AdoSelector):
         self.alpha_shrink = alpha_shrink
         self.alpha_min_halfwidth = alpha_min_halfwidth
         self.fit_data_path = fit_data_path  # if set, dump each refit's (D, L) for offline (bayesian) fits
+        # paper: the original joint lbfgs fit with simplex rows (src/scaling_law_paper.py), for comparison.
+        # the gamma/alpha options above only apply to the own-weight-1 fit
+        if fit_method not in ("own", "paper"):
+            raise ValueError(f"Unrecognized fit_method: {fit_method}. Options: ['own', 'paper']")
+        self.fit_method = fit_method
 
         self.fit_val = None
         self.gamma_spread = None
@@ -89,7 +96,10 @@ class EpiSelect(AdoSelector):
         metrics["gamma_spread"] = float(self.gamma_spread)
         metrics["fit_cond"] = float(self.fit_cond)
         metrics["alpha_range_width"] = float(np.mean(self.alpha_hi - self.alpha_lo))
-        gamma_KxK, alpha_K, beta_K, irred_K = readout_params(self.current_params, K)
+        params = self.current_params
+        if self.fit_method == "paper":  # log gamma with own weight 1 for both fits, so they compare directly
+            params = scaling_law_paper.to_own_weight(params, K)
+        gamma_KxK, alpha_K, beta_K, irred_K = readout_params(params, K)
         for i in range(K):
             metrics[f"param_alpha/task{i}"] = float(alpha_K[i])
             metrics[f"param_beta/task{i}"] = float(beta_K[i])
@@ -130,6 +140,9 @@ class EpiSelect(AdoSelector):
         params_Kx3pK, state = self._fit_scaling_law_fn()(cum_cnt_KxT, task_loss_KxT)
         self.fit_val, self.gamma_spread = state[0], state[1]
         params = np.array(multihost_utils.process_allgather(params_Kx3pK, tiled=True))
+        if self.fit_method == "paper":
+            self.gamma_spread = np.nan  # state[1] is the lbfgs iteration count
+            return params
         K2 = self.k * self.k
         log_gamma = params[:K2].reshape(self.k, self.k)
         if self.gamma_identity:
@@ -157,6 +170,8 @@ class EpiSelect(AdoSelector):
             np.savez(f, D=cum_cnt_KxT, L=task_loss_KxT)
 
     def _fit_scaling_law_fn(self):
+        if self.fit_method == "paper":
+            return functools.partial(scaling_law_paper.fit_scaling_law, mesh=self.mesh, K=self.k)
         return functools.partial(
             fit_scaling_law,
             mesh=self.mesh,
@@ -168,4 +183,5 @@ class EpiSelect(AdoSelector):
         )
 
     def _get_S_grads(self, D, current_params):
-        return jnp.exp(epiplexity_grads(D, current_params) / self.tau)
+        grads_fn = scaling_law_paper.epiplexity_grads if self.fit_method == "paper" else epiplexity_grads
+        return jnp.exp(grads_fn(D, current_params) / self.tau)

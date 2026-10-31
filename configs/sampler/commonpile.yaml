@@ -1,0 +1,3 @@
+_target_: src.dataloader.commonpile_loader.CommonPileTasksSampler
+_recursive_: false
+tasks: ${tasks}

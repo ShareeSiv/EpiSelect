@@ -153,3 +153,11 @@ def test_fit_recovers_31_domains():
     g, a, _, e = readout_params(theta, K)
     assert np.abs(g - gamma).max() < 1e-2
     assert np.abs(a - 0.3).max() < 1e-2 and np.abs(e - 1.7).max() < 1e-2
+
+
+def test_l1_zeros_survive_the_polish():
+    # the lm polish ignores the l1 penalty, so it must not move weights the penalised nnls set to 0
+    D, L, *_ = _synthetic(noise=0.003)
+    theta, _ = fit_scaling_law(jnp.asarray(D), jnp.asarray(L), None, K=D.shape[0], l1=1e6)
+    g, *_ = readout_params(theta, D.shape[0])
+    assert np.allclose(g, np.eye(D.shape[0]))

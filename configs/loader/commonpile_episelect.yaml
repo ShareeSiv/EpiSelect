@@ -32,3 +32,4 @@ alpha_range: [0.05, 0.8] # initial alpha search range
 alpha_shrink: 0.7        # each refit narrows the alpha range around the last alpha by this factor
 alpha_min_halfwidth: 0.05
 fit_data_path: null      # e.g. gs://bucket/run/fit_data_{step}.npz, for scripts/fit_scaling_law_bayes.py
+fit_method: own          # own (gamma_mm = 1, split fit) | paper (original joint lbfgs fit, for comparison)

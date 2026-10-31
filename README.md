@@ -42,6 +42,42 @@ python launch.py +experiment=124M/EpiSelect \
 ./scripts/tpu_launch.sh 124M/EpiSelect gs://your-bucket/commonpile_tfds gs://your-bucket/checkpoints
 ```
 
+## Small models on a Mac (MLX)
+
+`scripts/train_mlx.py` trains 5-20M-parameter models on the Apple-silicon GPU with MLX (`src/mlx_model.py`, a port of `src/model.py`), using the same loaders, data selectors, WSD schedule and exploration options as the JAX path. The default config (`configs/mlx.yaml`) trains a 10M model on 8 domains for 12k steps x 32 x 256 = 98M tokens, about an hour on an M5 Pro.
+
+```bash
+uv pip install -e ".[dev,mlx]"
+python scripts/train_mlx.py data_dir=/path/to/commonpile_tfds rundir=outputs/mlx/episelect_s0 seed=0
+python scripts/train_mlx.py sampler=synthetic  # no data on disk: bigram stand-in domains, for smoke runs
+```
+
+Each run writes `metrics.jsonl` (per-domain `val_loss/task{i}`, `val_balanced_loss`, `val_worst_loss`, the selector's metrics), `run_info.json` (domain names), `fit_data_{step}.npz` from each refit, and the final weights. Matmuls run in TF32 by default (`tf32: false` for full fp32, ~1.9x slower).
+
+To compare the paper's joint fit (`src/scaling_law_paper.py`, from the initial commit) with the own-weight-1 fit on a run's refits, fitting on the first 50% / 70% of each curve and predicting the rest:
+
+```bash
+python scripts/compare_fits.py outputs/mlx/episelect_s0 --every 2  # --bayes adds posterior 90% intervals on gamma
+```
+
+End to end, `scripts/sweep_mlx.py` runs five selectors x seeds, one run at a time, and summarises final and stable-phase balanced and worst-domain validation loss as mean ± std over seeds:
+
+| Arm | Loader config |
+|---|---|
+| `natural` | `mlx_natural`: token-proportional mixture throughout |
+| `ado` | `mlx_ado` |
+| `episelect_paper` | `mlx_episelect_paper`: the paper's joint fit (`fit_method: paper`) |
+| `episelect_own` | `mlx_episelect`: the own-weight-1 fit |
+| `gamma_identity` | `mlx_episelect_identity`: `gamma_identity: true` ablation |
+
+The two EpiSelect fits and the ablation share exploration, refit schedule and fit window, so they differ only in the fit.
+
+```bash
+python scripts/sweep_mlx.py plan data_dir=/path/to/commonpile_tfds   # print the 15 commands
+python scripts/sweep_mlx.py run data_dir=/path/to/commonpile_tfds    # run them; finished runs are skipped
+python scripts/sweep_mlx.py summarize                                # table + outputs/mlx_sweep/summary.json
+```
+
 ## Evaluate
 
 Point `configs/eval.yaml` at the checkpoints, then:

@@ -194,12 +194,12 @@ class CommonPileBalanced(Loader):
 
 
 class CommonPileTasksSampler(TasksSampler):
-    def __init__(self, split: str, block_size: int, data_dir: str):
+    def __init__(self, split: str, block_size: int, data_dir: str, tasks=None):
         self.n_proc = jax.process_count()
         self.proc_idx = jax.process_index()
         self.block_size = block_size
         dsets = []
-        self.tasks = common_pile_grouped.TASKS
+        self.tasks = list(tasks) if tasks is not None else common_pile_grouped.TASKS  # a subset, e.g. for mlx runs
         self.total_token_n = domain_tokens(self.tasks, split, data_dir)
         for task in self.tasks:
             dset = make_tfds_dataset(
