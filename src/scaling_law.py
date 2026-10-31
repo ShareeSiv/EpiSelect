@@ -2,13 +2,11 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-import jax.random as jr
 import numpy as np
 from jax import jit, vmap
 from jax.nn import logsumexp
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as P
-from jaxopt import LBFGS
+
+from src.nnls_utils import nnls
 
 
 def huber_loss(y_hat, y, delta=1e-3):
@@ -18,43 +16,11 @@ def huber_loss(y_hat, y, delta=1e-3):
     return jnp.where(abs_diff > delta, part1, part2)
 
 
-def sample_tilted_simplex(key, K, num_samples, tilt):
-    # dirichlet init
-    keys = jr.split(key, K)
-    all_gammas = []
-    for i in range(K):
-        alpha = jnp.ones(K).at[i].set(tilt)
-        all_gammas.append(jr.dirichlet(keys[i], alpha, shape=(num_samples,)))
-    return jnp.stack(all_gammas, axis=0)  # [K,G,K]
-
-
-def construct_sparse_inits(key, K):
-    # grid over the scalars, crossed with one tilted-simplex draw for gamma:
-    #   alpha in {0.0, 0.1, ..., 0.8}, log_beta in {-2, -1, ..., 6}, log_eps in {-2.0, -1.5, ..., 2.0}
-    # 9*9*9 = 729 inits. arange excludes its stop, hence the extra step on each bound
-    log_beta = jnp.arange(-2, 7, 1)
-    log_eps = jnp.arange(-2, 2.5, 0.5)
-    alpha = jnp.arange(0, 0.9, 0.1)
-    gamma_grid_n = 1
-    gamma = sample_tilted_simplex(key, K, num_samples=gamma_grid_n, tilt=10.0)  # [K,G,K]
-
-    A, B, E = jnp.meshgrid(alpha, log_beta, log_eps, indexing="ij")
-    scalars = jnp.stack([A, B, E], axis=-1).reshape(-1, 3)  # [S,3]
-    scalars = jnp.broadcast_to(scalars[None], shape=(K,) + scalars.shape)  # [K,S,3]
-
-    scalars_tiled = jnp.tile(scalars, (1, gamma.shape[1], 1))  # [K,GS,3]
-    gamma_expanded = jnp.repeat(gamma, scalars.shape[1], axis=-2)  # [K,GS,K]
-    gamma_expanded = jnp.transpose(gamma_expanded, axes=[2, 1, 0])
-
-    init_grid = jnp.concatenate([jnp.log(gamma_expanded), scalars_tiled], axis=-1)  # [K,GS,K+3]
-    init_grid = init_grid.transpose(1, 2, 0)  # [GS,K+3,K]
-    return init_grid.reshape(init_grid.shape[0], -1)  # [GS,K(K+3)]
-
-
 def _unpack(theta, K):
+    # own weight is 1: gamma_mm = 1, other rows are free non-negative weights (no simplex constraint)
     K2 = K * K
     log_gamma = theta[:K2].reshape(K, K)
-    log_gamma = log_gamma - logsumexp(log_gamma, axis=-1, keepdims=True)
+    log_gamma = jnp.where(jnp.eye(K, dtype=bool), 0.0, log_gamma)
     return log_gamma, theta[K2 : K2 + K], theta[K2 + K : K2 + 2 * K], theta[-K:]
 
 
@@ -67,24 +33,20 @@ def _log_loss(theta, x):
     return logsumexp(jnp.stack([term1, term2], axis=0), axis=0)
 
 
-def _fit_objective(params, D, L):
-    # D, L: [K,T]. huber on log-loss, plus barriers keeping the fit in a sane region
-    log_L_hat = _log_loss(params, jnp.transpose(D, axes=[1, 0]))  # [T,K]
-    log_L = jnp.log(jnp.transpose(L, axes=[1, 0]))  # [T,K]
-    _, alpha, log_beta, log_eps = _unpack(params, D.shape[0])
-
-    alpha_max = jnp.sum(jnp.maximum(alpha - 0.8, 0))  # alpha <= 0.8
-    alpha_min = jnp.sum(-jnp.minimum(alpha, 0.001))  # alpha >= 0
-    log_beta_max = jnp.sum(jnp.maximum(log_beta - 6.5, 0))  # beta <= ~665
-    log_eps_min = jnp.sum(-jnp.minimum(log_eps - 0.5, 0))  # eps >= 0.5
-
-    out = jnp.sum(huber_loss(log_L, log_L_hat, delta=1e-3))
-    return out + alpha_max + alpha_min + log_beta_max + log_eps_min
-
-
 def readout_params(theta, K):
     log_gamma, alpha, log_beta, log_eps = _unpack(theta, K=K)
     return np.exp(log_gamma), np.array(alpha), np.exp(log_beta), np.exp(log_eps)
+
+
+IDENTITY_L1 = 1e6  # an l1 this large zeroes every off-diagonal weight: the gamma = I law, refit
+
+
+def gamma_identified(theta, K, n_points, min_points=0, gamma_max=np.inf):
+    # guard for early refits: with own weight 1 nothing bounds the off-diagonal weights, and with too few
+    # points they can run off along the alpha-gamma ridge (seen up to ~1e4 on synthetic runs)
+    gamma = readout_params(theta, K)[0]
+    off = gamma[~np.eye(K, dtype=bool)]
+    return bool(n_points >= min_points and np.isfinite(off).all() and off.max(initial=0.0) <= gamma_max)
 
 
 def epiplexity_grads(tokens, params):
@@ -100,13 +62,184 @@ def epiplexity_grads(tokens, params):
     return np.sum((num / denom) * dS, axis=0)  # [K,]
 
 
-@partial(jit, static_argnums=(2, 3))
-def fit_scaling_law(D, L, mesh, K):
-    init_grid = construct_sparse_inits(key=jr.PRNGKey(21), K=K)  # [G,K(K+3)]
-    sharding = NamedSharding(mesh, P(("replica", "data"), None))
-    init_grid = jax.lax.with_sharding_constraint(init_grid, sharding)
+def _nnls_gamma(Dn, colscale, L_m, m, alpha, eps, l1, active=True):
+    # gamma step: with (alpha, eps) fixed, y = (L-eps)^(-1/alpha) is linear in the token counts with
+    # coefficients w_mk = beta^(-1/alpha) gamma_mk, so gamma = w / w_mm comes from one convex weighted NNLS.
+    # Dn: [T,K] column-normalised tokens, L_m: [T,]
+    K = Dn.shape[-1]
+    d = L_m - eps
+    # delta-method weights: noise on L becomes |dy/dL| times larger on y, so rows get s = 1/|dy/dL| / L.
+    # s*y = alpha*d/L, so the weighted problem never needs the (possibly huge) y itself
+    log_s = jnp.log(alpha) + (1.0 / alpha + 1.0) * jnp.log(d) - jnp.log(L_m)
+    log_sy = jnp.log(alpha) + jnp.log(d) - jnp.log(L_m)
+    shift = jnp.maximum(log_s.max(), log_sy.max())
+    A = jnp.exp(log_s - shift)[:, None] * Dn
+    b = jnp.exp(log_sy - shift)
 
-    solver = LBFGS(_fit_objective, tol=1e-5, jit=True, maxiter=200)
-    all_theta_hats, state = vmap(solver.run, in_axes=(0, None, None))(init_grid, D, L)
-    min_pos = jnp.nanargmin(state.value)
-    return all_theta_hats[min_pos], (state.value[min_pos], state.iter_num[min_pos])
+    w = (
+        nnls(A, b, c=l1 * (jnp.arange(K) != m), active=active) / colscale
+    )  # [K,] in token units, exact solve on the host
+    return w / jnp.maximum(w[m], 1e-30), w[m] > 0
+
+
+def _ols_eps_beta(z, L_m, alpha, eps_max):
+    # (eps, beta) step: with gamma and alpha fixed, L = eps + beta * z^(-alpha) is linear in (eps, beta).
+    # exact 2x2 least squares, then clip eps into [0, eps_max] and refit beta if the clip was active
+    x = z ** (-alpha)
+    xc, Lc = x - x.mean(), L_m - L_m.mean()
+    beta = jnp.sum(xc * Lc) / jnp.maximum(jnp.sum(xc**2), 1e-30)
+    eps = jnp.clip(L_m.mean() - beta * x.mean(), 0.0, eps_max)
+    beta = jnp.maximum(jnp.sum(x * (L_m - eps)) / jnp.maximum(jnp.sum(x**2), 1e-30), 1e-12)
+    return eps, beta
+
+
+def _log_pred(D_T, gamma, alpha, eps, beta):
+    z = jnp.maximum(D_T @ gamma, 1e-30)
+    return jnp.log(eps + beta * z ** (-alpha))
+
+
+def _score(D_T, L_m, gamma, alpha, eps, beta):
+    s = jnp.sum(huber_loss(_log_pred(D_T, gamma, alpha, eps, beta), jnp.log(L_m), delta=1e-3))
+    return jnp.where(jnp.isfinite(s), s, jnp.inf)
+
+
+def _fit_alpha(D_T, Dn, colscale, L_m, m, alpha, l1, max_alt, alt_tol):
+    # for one alpha: alternate exact OLS for (eps, beta) and NNLS for gamma, starting from gamma = I.
+    # the gamma step does not depend on beta, so one round is a scalar map eps -> F(eps) and the alternation is
+    # a fixed-point iteration on eps. plain iteration converges slowly, so it is accelerated with steffensen
+    # (aitken) steps, falling back to the plain iterate when the extrapolation is unusable.
+    # stops when eps moves by <= alt_tol * eps_max, or after max_alt steps (2 rounds each)
+    K = D_T.shape[-1]
+    eps_max = L_m.min() * (1.0 - 1e-3)  # keep eps safely below every observed loss
+
+    def F(eps, gamma, active=True):
+        new_gamma, ok = _nnls_gamma(Dn, colscale, L_m, m, alpha, eps, l1, active)
+        new_gamma = jnp.where(ok, new_gamma, gamma)
+        return _ols_eps_beta(D_T @ new_gamma, L_m, alpha, eps_max)[0], new_gamma
+
+    def cond(carry):
+        _, _, it, change = carry
+        return (it < max_alt) & (change > alt_tol * eps_max)
+
+    def body(carry):
+        # under vmap every problem runs this body until the slowest converges; only active ones are solved
+        e0, gamma, it, _ = carry
+        active = cond(carry)
+        e1, gamma = F(e0, gamma, active)
+        e2, gamma = F(e1, gamma, active)
+        denom = e2 - 2.0 * e1 + e0
+        e_acc = e0 - (e1 - e0) ** 2 / jnp.where(denom == 0, 1.0, denom)
+        usable = (jnp.abs(denom) > 1e-12 * eps_max) & jnp.isfinite(e_acc)
+        e_new = jnp.clip(jnp.where(usable, e_acc, e2), 0.0, eps_max)
+        return e_new, gamma, it + 1, jnp.abs(e_new - e0)
+
+    gamma0 = (jnp.arange(K) == m).astype(L_m.dtype)
+    eps0 = _ols_eps_beta(D_T @ gamma0, L_m, alpha, eps_max)[0]
+    eps, gamma, _, _ = jax.lax.while_loop(cond, body, (eps0, gamma0, 0, jnp.array(jnp.inf, L_m.dtype)))
+    gamma = F(eps, gamma)[1]  # gamma for the converged eps
+    eps, beta = _ols_eps_beta(D_T @ gamma, L_m, alpha, eps_max)  # final (eps, beta) for the final gamma
+    return _score(D_T, L_m, gamma, alpha, eps, beta), gamma, eps, beta
+
+
+def _lm_polish(D_T, L_m, m, gamma, alpha, eps, beta, fix_alpha, alpha_bounds, iters, keep_zeros=False):
+    # joint levenberg-marquardt on all parameters, in log-loss space, projected onto the feasible set.
+    # params: [gamma (K), log_beta, alpha, eps]; gamma_mm (and alpha, if shared) are held fixed.
+    # keep_zeros: also hold the weights the l1-penalised nnls set to 0, since lm ignores the penalty
+    K = D_T.shape[-1]
+    log_L = jnp.log(L_m)
+    eps_max = L_m.min() * (1.0 - 1e-3)
+    free_gamma = (jnp.arange(K) != m) & ~(keep_zeros & (gamma == 0))
+    free = jnp.concatenate([free_gamma, jnp.array([True, not fix_alpha, True])]).astype(L_m.dtype)
+
+    def resid(p):
+        return _log_pred(D_T, p[:K], p[K + 1], p[K + 2], jnp.exp(p[K])) - log_L
+
+    def project(p):
+        p = p.at[:K].set(jnp.maximum(p[:K], 0.0))
+        p = p.at[K + 1].set(jnp.clip(p[K + 1], *alpha_bounds))
+        return p.at[K + 2].set(jnp.clip(p[K + 2], 0.0, eps_max))
+
+    def cost(p):
+        c = jnp.sum(resid(p) ** 2)
+        return jnp.where(jnp.isfinite(c), c, jnp.inf)
+
+    def body(_, carry):
+        p, lam, c = carry
+        r, J = resid(p), jax.jacfwd(resid)(p) * free[None]
+        H = J.T @ J
+        H = H + lam * jnp.diag(jnp.diag(H) + 1e-12) + (1.0 - free) * jnp.eye(p.shape[0])  # pin fixed params
+        step = jnp.linalg.solve(H, -J.T @ r) * free
+        p_new = project(p + step)
+        c_new = cost(p_new)
+        better = c_new < c
+        return jnp.where(better, p_new, p), jnp.where(better, lam / 3.0, lam * 3.0), jnp.minimum(c, c_new)
+
+    p0 = jnp.concatenate([gamma, jnp.array([jnp.log(beta), alpha, eps])])
+    p, _, _ = jax.lax.fori_loop(0, iters, body, (p0, 1e-2, cost(p0)))
+    return p[:K], p[K + 1], p[K + 2], jnp.exp(p[K])
+
+
+@partial(jit, static_argnames=("mesh", "K", "n_alpha", "shared_alpha", "max_alt", "lm_iters"))
+def fit_scaling_law(
+    D,
+    L,
+    mesh,
+    K,
+    l1=0.0,
+    alpha_lo=None,
+    alpha_hi=None,
+    n_alpha=31,
+    shared_alpha=False,
+    max_alt=50,
+    alt_tol=1e-6,
+    lm_iters=50,
+):
+    # D, L: [K,T]. split the problem by how each parameter enters the law:
+    #   alpha: 1-d grid search (per domain, or one alpha shared by all domains)
+    #   inside, per alpha: alternate exact OLS for (eps, beta) and weighted NNLS for gamma
+    #   then a joint levenberg-marquardt polish in log-loss space from the best grid point.
+    # alpha_lo/alpha_hi: [K,] per-domain search range, so refits can narrow it around the previous alpha
+    del mesh
+    alpha_lo = jnp.full((K,), 0.05) if alpha_lo is None else alpha_lo
+    alpha_hi = jnp.full((K,), 0.8) if alpha_hi is None else alpha_hi
+    if shared_alpha:  # one grid for everyone, so scores are comparable across domains
+        alpha_lo, alpha_hi = jnp.full((K,), alpha_lo.min()), jnp.full((K,), alpha_hi.max())
+    alphas_KxA = alpha_lo[:, None] + (alpha_hi - alpha_lo)[:, None] * jnp.linspace(0.0, 1.0, n_alpha)[None]
+
+    D_T = D.T  # [T,K]
+    colscale = jnp.maximum(D.max(axis=-1), 1.0)  # [K,]
+    Dn = D_T / colscale
+
+    fit_grid = vmap(_fit_alpha, in_axes=(None, None, None, None, None, 0, None, None, None))
+    scores_KxA, gamma_KxAxK, eps_KxA, beta_KxA = vmap(
+        lambda L_m, m, alphas: fit_grid(D_T, Dn, colscale, L_m, m, alphas, l1, max_alt, alt_tol)
+    )(L, jnp.arange(K), alphas_KxA)
+
+    if shared_alpha:
+        best_K = jnp.full((K,), jnp.argmin(scores_KxA.sum(0)))
+    else:
+        best_K = jnp.argmin(scores_KxA, axis=-1)
+    take = lambda x: jnp.take_along_axis(x, best_K.reshape((K,) + (1,) * (x.ndim - 1)), axis=1)[:, 0]  # noqa: E731
+    gamma, eps, beta, alpha = take(gamma_KxAxK), take(eps_KxA), take(beta_KxA), take(alphas_KxA)
+    grid_score = take(scores_KxA)
+
+    # identifiability check: how much does gamma move across alphas that fit about as well as the best?
+    near = (scores_KxA <= grid_score[:, None] * 1.1 + 1e-4)[..., None]
+    spread = jnp.where(near, gamma_KxAxK, -jnp.inf).max(1) - jnp.where(near, gamma_KxAxK, jnp.inf).min(1)
+    spread = jnp.where(jnp.eye(K, dtype=bool), 0.0, spread).max(-1)  # [K,]
+
+    def polish(L_m, m, g, a, e, b, lo, hi):
+        g2, a2, e2, b2 = _lm_polish(D_T, L_m, m, g, a, e, b, shared_alpha, (lo, hi), lm_iters, keep_zeros=l1 > 0)
+        s2 = _score(D_T, L_m, g2, a2, e2, b2)
+        return s2, g2, a2, e2, b2
+
+    s2, g2, a2, e2, b2 = vmap(polish)(L, jnp.arange(K), gamma, alpha, eps, beta, alpha_lo, alpha_hi)
+    # lm minimises squared error, the grid minimises huber; keep the polish only where it did not hurt
+    keep = s2 <= grid_score
+    pick = lambda new, old: jnp.where(keep.reshape((K,) + (1,) * (old.ndim - 1)), new, old)  # noqa: E731
+    gamma, alpha, eps, beta = pick(g2, gamma), pick(a2, alpha), pick(e2, eps), pick(b2, beta)
+    value = jnp.where(keep, s2, grid_score)
+
+    log_gamma = jnp.log(jnp.maximum(gamma, 1e-12))
+    theta = jnp.concatenate([log_gamma.reshape(-1), alpha, jnp.log(beta), jnp.log(jnp.maximum(eps, 1e-12))])
+    return theta, (jnp.sum(value), jnp.mean(spread))

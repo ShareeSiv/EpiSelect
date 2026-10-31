@@ -1,0 +1,7 @@
+# bigram sources standing in for the real domains (no data on disk), for smoke runs
+_target_: src.dataloader.synthetic_loader.SyntheticTasksSampler
+_recursive_: false
+tasks: ${tasks}
+vocab: 256
+shared: 0.8
+seed: 0

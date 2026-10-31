@@ -1,0 +1,10 @@
+# commonpile_ado scaled to ~12k-step mlx runs: refit every 500 steps
+defaults:
+  - commonpile_ado
+  - _self_
+
+data_dir: ${data_dir}
+tasks_sampler_cfg: ${sampler}
+ignore_steps: 200
+start_step: 1000
+update_interval: 500

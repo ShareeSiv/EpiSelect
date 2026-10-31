@@ -17,6 +17,7 @@ from tqdm import trange
 
 from src.dataloader import commonpile_loader
 from src.dataloader.abstract import Loader
+from src.lr_schedule import make_lr_schedule, stable_end_step
 
 from .model import GPT, count_params, shard_gpt
 from .sharding import get_data_sharding, get_shard_fn, reshard
@@ -153,9 +154,7 @@ def train(config):
             options=ocp.CheckpointManagerOptions(max_to_keep=None, save_interval_steps=config.eval_interval),
         )
 
-    scheduler = optax.warmup_cosine_decay_schedule(
-        0, config.learning_rate, config.warmup_steps, config.lr_decay_steps, end_value=config.min_lr
-    )
+    scheduler = make_lr_schedule(config)
 
     @jax.jit
     def get_lr(_opt_state):
@@ -195,8 +194,13 @@ def train(config):
         opt_state = jtu.tree_unflatten(jtu.tree_structure(opt_state), opt_state_leaves)
         first_step = mngr.latest_step() + 1
 
+    # with a stable phase, the scaling law is only fit on it so the lr decay does not fake loss drops
+    # (only the adaptive loaders take it, so it is not passed to the natural baseline)
+    fit_max_step = config.loader.get("fit_max_step") or stable_end_step(config)
+    extra = {"fit_max_step": fit_max_step} if "fit_max_step" in config.loader else {}
     train_sampler: Loader = hydra.utils.instantiate(
         config.loader,
+        **extra,
         batch_size=config.batch_size,
         split="train",
         mesh=mesh,

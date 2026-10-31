@@ -17,3 +17,21 @@ tau: 1.0
 fit_freq: 20
 window_length: 101       # savgol filter window over the noisy per-step loss
 polyorder: 3
+fit_max_frac: 1.0        # fit only this leading fraction of points (set <1 to avoid lr-decay drops)
+gamma_l1: 0.0            # l1 penalty on off-diagonal gamma in the inner regression
+gamma_smooth: 0.0        # ema weight on previous refit's gamma
+gamma_identity: false    # ablation: gamma = I
+fit_max_step: null       # fit only steps below this; defaults to the end of the wsd stable phase
+explore_steps: 0         # opening phase that varies the mixture so gamma is identified (0 = off)
+explore_mode: burst      # burst | dirichlet
+burst_len: 10            # steps per burst / per dirichlet draw
+burst_mass: 0.8          # burst: probability mass on the burst domain
+explore_concentration: 0.3  # dirichlet concentration
+shared_alpha: false      # one alpha for every domain (1-d search over a common grid)
+alpha_range: [0.05, 0.8] # initial alpha search range
+alpha_shrink: 0.7        # each refit narrows the alpha range around the last alpha by this factor
+alpha_min_halfwidth: 0.05
+fit_data_path: null      # e.g. gs://bucket/run/fit_data_{step}.npz, for scripts/fit_scaling_law_bayes.py
+min_fit_points: 50       # own fit: with fewer points per curve, gamma is not trusted and the refit uses gamma = I
+gamma_max: 10.0          # own fit: same fallback if any off-diagonal gamma exceeds this
+fit_method: own          # own (gamma_mm = 1, split fit) | paper (original joint lbfgs fit, for comparison)

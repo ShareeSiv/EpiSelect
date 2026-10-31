@@ -1,0 +1,13 @@
+# commonpile_episelect scaled to ~12k-step mlx runs: bursts first so gamma is identified, then refit every 500 steps
+defaults:
+  - commonpile_episelect
+  - _self_
+
+data_dir: ${data_dir}
+tasks_sampler_cfg: ${sampler}
+ignore_steps: 200        # keep the exploration phase in the fit
+start_step: 1000
+update_interval: 500
+explore_steps: 1000
+burst_len: 25            # 8 domains x 25 steps = 5 burst cycles in the exploration phase
+fit_data_path: ${rundir}/fit_data_{step}.npz

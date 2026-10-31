@@ -1,0 +1,9 @@
+# natural mixture: sample domains by token count throughout. same sampler path as the adaptive arms;
+# the ado selector never refits because start_step is past the end of the run
+defaults:
+  - commonpile_ado
+  - _self_
+
+data_dir: ${data_dir}
+tasks_sampler_cfg: ${sampler}
+start_step: 1000000000

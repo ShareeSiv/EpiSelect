@@ -24,6 +24,7 @@ from transformers import AutoTokenizer
 
 from src.dataloader.commonpile_loader import make_tfds_dataset
 from src.harness.lm_harness_eval import LMEvaluator
+from src.lr_schedule import make_lr_schedule
 from src.model import GPT, count_params, shard_gpt
 from src.sharding import reshard
 from src.tfds import common_pile_grouped
@@ -61,7 +62,7 @@ def _load_model(rundir, mesh, cfg):
     print(f"  {count_params(model):,} params")
 
     # The optimizer state is part of the checkpoint, so rebuild it to restore
-    sched = optax.warmup_cosine_decay_schedule(0, cfg.learning_rate, cfg.warmup_steps, cfg.lr_decay_steps, cfg.min_lr)
+    sched = make_lr_schedule(cfg)
     opt = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.scale_by_adam(b2=cfg.beta2),

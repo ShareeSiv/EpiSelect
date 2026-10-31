@@ -4,7 +4,7 @@ import jax.random as jr
 import numpy as np
 from jax.sharding import Mesh
 
-from src.scaling_law import construct_sparse_inits, epiplexity_grads, fit_scaling_law
+from src.scaling_law import _score, epiplexity_grads, fit_scaling_law, gamma_identified, readout_params
 
 
 def np_loss(gamma, alpha, beta, eps, x):
@@ -63,32 +63,111 @@ def test_epiplexity_grads_match_reference():
     approx = epiplexity_grads(tokens.T, params=theta)
     assert approx.shape == (K,)
 
-    # the fit normalizes each gamma row onto the simplex, so the reference must too
-    gamma = np.exp(log_gamma) / np.sum(np.exp(log_gamma), axis=-1, keepdims=True)
+    # own weight is fixed to 1, so the reference must pin the diagonal too
+    gamma = np.exp(np.where(np.eye(K, dtype=bool), 0.0, np.asarray(log_gamma)))
     soln = np_grads(gamma, alpha, np.exp(log_beta), np.exp(log_eps), x=tokens)
     assert np.sum(np.abs(soln - approx)) < 1e-7
 
 
-def test_construct_sparse_inits_shape():
-    # 9 alpha x 9 log_beta x 9 log_eps = 729, tiled by gamma_grid_n = 1
-    K = 2
-    assert construct_sparse_inits(jr.PRNGKey(21), K).shape == (729, K * (K + 3))
-
-
-def test_construct_sparse_inits_layout():
+def test_unpack_fixes_own_weight_and_keeps_gamma_nonnegative():
     K = 3
-    K2 = K * K
-    theta = np.array(construct_sparse_inits(key=jr.PRNGKey(0), K=K)[0])  # [K(K+3)]
+    theta = np.array(jr.normal(jr.PRNGKey(0), (K * (K + 3),)))
+    gamma, _, _, _ = readout_params(jnp.asarray(theta), K)
+    assert np.allclose(np.diag(gamma), 1.0)
+    assert (gamma >= 0).all()
 
-    log_gamma = theta[:K2].reshape(K, K)
-    alpha, log_beta, log_eps = theta[K2 : K2 + K], theta[K2 + K : K2 + 2 * K], theta[-K:]
 
-    # each scalar is broadcast to K identical values
-    assert np.allclose(alpha, alpha[0])
-    assert np.allclose(log_beta, log_beta[0])
-    assert np.allclose(log_eps, log_eps[0])
+def _synthetic(K=4, T=200, noise=0.0, seed=0):
+    rng = np.random.default_rng(seed)
+    gamma = np.eye(K)
+    gamma[0, 1], gamma[2, 3] = 0.4, 0.2
+    alpha, beta, eps = np.array([0.3, 0.4, 0.5, 0.35]), np.array([5.0, 4.0, 6.0, 3.0]), np.array([1.7, 1.5, 1.9, 1.6])
+    # single-domain bursts so the columns of N move independently (random mixtures leave them near-collinear)
+    steps = np.zeros((T, K))
+    for start in range(0, T, 10):
+        steps[start : start + 10, rng.integers(K)] = 1e4
+    steps += 1e2
+    D = np.cumsum(steps, axis=0).T + 1e3  # [K,T]
+    L = eps[:, None] + beta[:, None] * (gamma @ D) ** (-alpha[:, None])
+    L = L * np.exp(noise * rng.standard_normal(L.shape))
+    return D.astype(np.float32), L.astype(np.float32), gamma, alpha, eps
 
-    gamma = np.exp(log_gamma)
-    assert all(gamma[m, m] == max(gamma[m]) for m in range(K)), "inits should be diagonally dominant"
-    assert not all(np.allclose(gamma[0], gamma[m]) for m in range(1, K)), "rows should differ"
-    assert all(np.allclose(1.0, gamma[m].sum()) for m in range(K)), "rows should lie on the simplex"
+
+def test_fit_recovers_synthetic_law():
+    mesh = Mesh(np.array(jax.devices()).reshape(1, -1), ("replica", "data"))
+    D, L, gamma, alpha, eps = _synthetic()
+    K = D.shape[0]
+    theta, (value, spread) = fit_scaling_law(jnp.asarray(D), jnp.asarray(L), mesh, K=K)
+    g_hat, a_hat, _, e_hat = readout_params(theta, K)
+    assert np.allclose(np.diag(g_hat), 1.0)
+    assert np.abs(g_hat - gamma).max() < 0.15
+    assert np.abs(e_hat - eps).max() < 0.3
+    assert np.isfinite(value) and np.isfinite(spread)
+
+
+def test_fit_never_nan_with_eps_grid_near_loss():
+    mesh = Mesh(np.array(jax.devices()).reshape(1, -1), ("replica", "data"))
+    D, L, *_ = _synthetic(noise=0.01)
+    theta, _ = fit_scaling_law(jnp.asarray(D), jnp.asarray(L), mesh, K=D.shape[0])
+    assert np.isfinite(np.asarray(theta)).all()
+
+
+def test_fit_matches_true_params_under_noise():
+    # with noise gamma need not be recovered, but the optimiser should fit at least as well as the truth
+    D, L, gamma, alpha, eps = _synthetic(noise=0.01)
+    beta = np.array([5.0, 4.0, 6.0, 3.0])
+    theta, _ = fit_scaling_law(jnp.asarray(D), jnp.asarray(L), None, K=D.shape[0])
+    g, a, b, e = readout_params(theta, D.shape[0])
+    for m in range(D.shape[0]):
+        true = float(
+            _score(jnp.asarray(D.T), jnp.asarray(L[m]), jnp.asarray(gamma[m], jnp.float32), alpha[m], eps[m], beta[m])
+        )
+        fit = float(_score(jnp.asarray(D.T), jnp.asarray(L[m]), jnp.asarray(g[m]), a[m], e[m], b[m]))
+        assert fit <= true * 1.05
+
+
+def test_shared_alpha_and_narrowed_range():
+    D, L, *_ = _synthetic()
+    K = D.shape[0]
+    theta, _ = fit_scaling_law(jnp.asarray(D), jnp.asarray(L), None, K=K, shared_alpha=True)
+    _, a, _, _ = readout_params(theta, K)
+    assert np.allclose(a, a[0])
+    lo, hi = jnp.full((K,), 0.2), jnp.full((K,), 0.3)
+    theta, _ = fit_scaling_law(jnp.asarray(D), jnp.asarray(L), None, K=K, alpha_lo=lo, alpha_hi=hi)
+    _, a, _, _ = readout_params(theta, K)
+    assert (a >= 0.2 - 1e-6).all() and (a <= 0.3 + 1e-6).all()
+
+
+def test_fit_recovers_31_domains():
+    # 31 domains with single-domain bursts: the alternation must run to convergence to recover the transfer weights
+    rng = np.random.default_rng(0)
+    K, T = 31, 400
+    steps = np.full((T, K), 1e2)
+    for start in range(0, T, 5):
+        steps[start : start + 5, rng.integers(K)] += 1e4
+    D = (np.cumsum(steps, 0).T + 1e3).astype(np.float32)
+    gamma = np.eye(K)
+    gamma[0, 1], gamma[2, 3], gamma[5, 9] = 0.4, 0.2, 0.3
+    L = (1.7 + 5 * (gamma @ D) ** -0.3).astype(np.float32)
+    theta, _ = fit_scaling_law(jnp.asarray(D), jnp.asarray(L), None, K=K)
+    g, a, _, e = readout_params(theta, K)
+    assert np.abs(g - gamma).max() < 1e-2
+    assert np.abs(a - 0.3).max() < 1e-2 and np.abs(e - 1.7).max() < 1e-2
+
+
+def test_l1_zeros_survive_the_polish():
+    # the lm polish ignores the l1 penalty, so it must not move weights the penalised nnls set to 0
+    D, L, *_ = _synthetic(noise=0.003)
+    theta, _ = fit_scaling_law(jnp.asarray(D), jnp.asarray(L), None, K=D.shape[0], l1=1e6)
+    g, *_ = readout_params(theta, D.shape[0])
+    assert np.allclose(g, np.eye(D.shape[0]))
+
+
+def test_gamma_identified_guard():
+    K = 3
+    log_gamma = np.log(np.maximum(np.array([[1.0, 0.5, 0.0], [0.0, 1.0, 0.0], [0.0, 20.0, 1.0]]), 1e-12))
+    theta = jnp.asarray(np.concatenate([log_gamma.ravel(), np.full(K, 0.3), np.zeros(K), np.zeros(K)]))
+    assert gamma_identified(theta, K, n_points=100)
+    assert not gamma_identified(theta, K, n_points=100, gamma_max=10.0)
+    assert not gamma_identified(theta, K, n_points=20, min_points=50)
+    assert not gamma_identified(jnp.full_like(theta, jnp.nan), K, n_points=100)

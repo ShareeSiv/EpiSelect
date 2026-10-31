@@ -10,6 +10,7 @@ from jax.experimental import multihost_utils
 from src.data_selectors.ado import AdoSelector
 from src.data_selectors.episelect import EpiSelect
 from src.dataloader.abstract import Array
+from src.dataloader.explore import exploration_dist
 from src.sharding import get_data_sharding, get_shard_fn
 
 from .abstract import Loader
@@ -61,6 +62,24 @@ class AdaptiveLoader(Loader):
         window_length: int,
         polyorder: int,
         tau: float,
+        fit_max_frac: float = 1.0,
+        fit_max_step: tp.Optional[int] = None,
+        explore_steps: int = 0,
+        explore_mode: str = "burst",  # burst | dirichlet
+        burst_len: int = 10,
+        burst_mass: float = 0.8,
+        explore_concentration: float = 0.3,
+        gamma_l1: float = 0.0,
+        gamma_smooth: float = 0.0,
+        gamma_identity: bool = False,
+        shared_alpha: bool = False,
+        alpha_range: tp.Sequence[float] = (0.05, 0.8),
+        alpha_shrink: float = 0.7,
+        alpha_min_halfwidth: float = 0.05,
+        fit_data_path: tp.Optional[str] = None,
+        fit_method: str = "own",  # own | paper
+        min_fit_points: int = 0,
+        gamma_max: float = float("inf"),
         mode: str = "empirical",  # empirical | uniform
         policy_type: str = "episelect",
         y_axis: str = "train_loss",  # train_loss | val_loss
@@ -74,6 +93,15 @@ class AdaptiveLoader(Loader):
         self.block_size = block_size
         self.g_accum_iters = g_accum_iters
         self.batch_size = batch_size
+        self.seed = seed
+        self.explore_steps = explore_steps
+        self.explore_kwargs = dict(
+            mode=explore_mode,
+            seed=seed,
+            burst_len=burst_len,
+            burst_mass=burst_mass,
+            concentration=explore_concentration,
+        )
 
         self.tasks_sampler: TasksSampler = hydra.utils.instantiate(tasks_sampler_cfg, split, block_size, data_dir)
         self.k = self.tasks_sampler.k
@@ -99,6 +127,19 @@ class AdaptiveLoader(Loader):
                 window_length=window_length,
                 polyorder=polyorder,
                 tau=tau,
+                fit_max_frac=fit_max_frac,
+                fit_max_step=fit_max_step,
+                gamma_l1=gamma_l1,
+                gamma_smooth=gamma_smooth,
+                gamma_identity=gamma_identity,
+                shared_alpha=shared_alpha,
+                alpha_range=tuple(alpha_range),
+                alpha_shrink=alpha_shrink,
+                alpha_min_halfwidth=alpha_min_halfwidth,
+                fit_data_path=fit_data_path,
+                fit_method=fit_method,
+                min_fit_points=min_fit_points,
+                gamma_max=gamma_max,
             )
         if policy_type not in SELECTORS:
             raise ValueError(f"Unrecognized policy_type: {policy_type}. Options: {sorted(SELECTORS)}")
@@ -118,7 +159,10 @@ class AdaptiveLoader(Loader):
         B = self.batch_size // self.n_procs
         BG = B * self.g_accum_iters
 
-        task_probs_K = np.float64(self.curr_dist0)
+        if itr < self.explore_steps:
+            task_probs_K = exploration_dist(itr, np.float64(self.data_policy.empirical_dist), **self.explore_kwargs)
+        else:
+            task_probs_K = np.float64(self.curr_dist0)
         task_probs_K /= task_probs_K.sum()
         idx = self.rng.choice(np.arange(self.k), BG, p=task_probs_K, replace=True)
         cnt = Counter(idx)
