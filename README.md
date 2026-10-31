@@ -109,7 +109,7 @@ The law is `L_m = eps_m + beta_m * z_m^(-alpha_m)` with `z_m = n_m + sum_{k!=m} 
 | `alpha_m` | 1-d grid search, per domain or one shared alpha (`shared_alpha`) |
 | all of them | projected Levenberg-Marquardt polish in log-loss space, kept only if it does not worsen the Huber score |
 
-For each alpha, the (eps, beta) and gamma steps alternate from `gamma = I`. Every refit narrows each domain's alpha range around its previous alpha (`alpha_range`, `alpha_shrink`, `alpha_min_halfwidth`) and can smooth gamma across refits (`gamma_smooth`). `gamma_spread` and `fit_cond` are logged to check that gamma is identified; `gamma_l1`, `gamma_identity` (ablation), `fit_max_frac`/`fit_max_step`, the `lr_schedule: wsd` option and the early `explore_steps` phase are in the configs.
+For each alpha, the (eps, beta) and gamma steps alternate from `gamma = I`. Every refit narrows each domain's alpha range around its previous alpha (`alpha_range`, `alpha_shrink`, `alpha_min_halfwidth`) and can smooth gamma across refits (`gamma_smooth`). With own weight 1 nothing bounds gamma, so early refits on few points can blow up: below `min_fit_points` points, or with any off-diagonal gamma above `gamma_max`, a refit falls back to the gamma = I law (logged as `gamma_guarded`). `gamma_spread` and `fit_cond` are logged to check that gamma is identified; `gamma_l1`, `gamma_identity` (ablation), `fit_max_frac`/`fit_max_step`, the `lr_schedule: wsd` option and the early `explore_steps` phase are in the configs.
 
 For uncertainty on gamma, set `fit_data_path` to dump each refit's `(D, L)` and run the same model with full Bayes (NUTS, needs `pip install -e .[bayes]`):
 

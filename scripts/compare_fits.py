@@ -1,4 +1,5 @@
 import argparse
+import functools
 import glob
 import json
 import os
@@ -11,8 +12,7 @@ import numpy as np
 from jax.sharding import Mesh
 
 from src import scaling_law, scaling_law_paper
-
-IDENTITY_L1 = 1e6  # an l1 this large zeroes every off-diagonal weight: the gamma = I law, refit
+from src.scaling_law import IDENTITY_L1, gamma_identified
 
 
 def fit_paper(D, L, near=1.1):
@@ -46,9 +46,18 @@ def fit_own(D, L, l1=0.0):
     }
 
 
+def fit_own_guarded(D, L, min_points=50, gamma_max=10.0):
+    # what the selector uses with min_fit_points / gamma_max set: the gamma = I law when gamma is not identified
+    fit = fit_own(D, L)
+    if gamma_identified(fit["theta"], D.shape[0], D.shape[1], min_points, gamma_max):
+        return {**fit, "guarded": False}
+    return {**fit_own(D, L, l1=IDENTITY_L1), "guarded": True}
+
+
 METHODS = {
     "paper": fit_paper,
     "own": fit_own,
+    "own_guarded": fit_own_guarded,
     "identity": lambda D, L: fit_own(D, L, l1=IDENTITY_L1),
 }
 
@@ -121,6 +130,7 @@ def compare(dumps, fracs=(0.5, 0.7), methods=tuple(METHODS), tie_tol=0.05, weak_
         report["methods"][name] = {
             "heldout": {str(frac): held_out_error(fit_fn, D_last, L_last, frac) for frac in fracs},
             "gamma_spread": [f["spread"] for f in refits],
+            "guarded": [bool(f.get("guarded", False)) for f in refits],
             "stability": gamma_stability(gammas),
             "gamma_last": gammas[-1].tolist(),
         }
@@ -165,31 +175,34 @@ def print_report(report):
     fracs = list(next(iter(report["methods"].values()))["heldout"])
     for frac in fracs:
         print(f"\nfit on the first {float(frac):.0%} of the last refit's curve, predict the rest (log-loss errors)")
-        print(f"{'method':9s} {'train rmse':>11s} {'held-out':>10s} {'worst dom':>10s} {'final rel':>10s} {'secs':>7s}")
+        print(
+            f"{'method':11s} {'train rmse':>11s} {'held-out':>10s} {'worst dom':>10s} {'final rel':>10s} {'secs':>7s}"
+        )
         for name, m in report["methods"].items():
             h = m["heldout"][frac]
             print(
-                f"{name:9s} {h['train_rmse']:11.3e} {h['heldout_rmse']:10.3e} {h['heldout_rmse_worst']:10.3e} "
+                f"{name:11s} {h['train_rmse']:11.3e} {h['heldout_rmse']:10.3e} {h['heldout_rmse_worst']:10.3e} "
                 f"{h['final_rel_err']:10.3e} {h['seconds']:7.1f}"
             )
     print("\ngamma across refits (own-weight-1 normalisation, off-diagonal)")
     print(
-        f"{'method':9s} {'mean |chg|':>11s} {'median |chg|':>13s} {'mean std':>9s} {'max last':>9s} {'spread last':>12s}",
+        f"{'method':11s} {'mean |chg|':>11s} {'median |chg|':>13s} {'mean std':>9s} {'max last':>9s} {'spread last':>12s}",
         end="",
     )
     print(f" {'in bayes 90%':>13s}" if "bayes" in report else "")
     for name, m in report["methods"].items():
         s = m["stability"]
         print(
-            f"{name:9s} {s['mean_abs_change']:11.3e} {s['median_abs_change']:13.3e} {s['mean_std']:9.3e} "
+            f"{name:11s} {s['mean_abs_change']:11.3e} {s['median_abs_change']:13.3e} {s['mean_std']:9.3e} "
             f"{s['max_offdiag_last']:9.3f} "
             f"{m['gamma_spread'][-1]:12.3e}",
             end="",
         )
         print(f" {m['frac_offdiag_in_bayes_90']:13.2f}" if "bayes" in report else "")
-    print("\nlargest off-diagonal gamma at each refit")
+    print("\nlargest off-diagonal gamma at each refit (* = guard fell back to gamma = I)")
     for name, m in report["methods"].items():
-        print(f"{name:9s} " + " ".join(f"{v:9.3g}" for v in m["stability"]["max_offdiag_per_refit"]))
+        cells = (f"{v:8.3g}{'*' if g else ' '}" for v, g in zip(m["stability"]["max_offdiag_per_refit"], m["guarded"]))
+        print(f"{name:11s} " + " ".join(cells))
     for flag in report["flags"]:
         print(f"\nNOTE: {flag}")
 
@@ -202,9 +215,14 @@ def main():
     parser.add_argument("--last", type=int, default=None, help="only use the last N refits")
     parser.add_argument("--every", type=int, default=1, help="only use every Nth refit (the last is always kept)")
     parser.add_argument("--bayes", action="store_true", help="also run the full-Bayes fit on the last refit")
+    parser.add_argument("--min_fit_points", type=int, default=50, help="own_guarded: as the selector's option")
+    parser.add_argument("--gamma_max", type=float, default=10.0, help="own_guarded: as the selector's option")
     parser.add_argument("--out", default=None, help="json report (default: <run dir>/compare_fits.json)")
     args = parser.parse_args()
 
+    METHODS["own_guarded"] = functools.partial(
+        fit_own_guarded, min_points=args.min_fit_points, gamma_max=args.gamma_max
+    )
     dumps = load_dumps(args.paths)
     if args.last:
         dumps = dumps[-args.last :]

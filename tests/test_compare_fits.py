@@ -38,7 +38,9 @@ def test_compare_on_dumps(tmp_path):
         np.savez(tmp_path / f"fit_data_{n}.npz", D=D[:, :n], L=L[:, :n])
     dumps = load_dumps([str(tmp_path)])
     assert [s for s, _, _ in dumps] == [60, 90, 120]
-    report = compare(dumps, fracs=(0.6,), methods=("own", "identity"))
+    report = compare(dumps, fracs=(0.6,), methods=("own", "own_guarded", "identity"))
+    # 60 points at the first refit: the guard (min 50 points) keeps the own-weight fit throughout
+    assert report["methods"]["own_guarded"]["guarded"] == [False, False, False]
     own, eye = report["methods"]["own"], report["methods"]["identity"]
     assert np.allclose(eye["gamma_last"], np.eye(4))
     # the data have transfer (gamma_01 = 0.4), so the own-weight fit predicts better than gamma = I

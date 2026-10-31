@@ -4,7 +4,7 @@ import jax.random as jr
 import numpy as np
 from jax.sharding import Mesh
 
-from src.scaling_law import _score, epiplexity_grads, fit_scaling_law, readout_params
+from src.scaling_law import _score, epiplexity_grads, fit_scaling_law, gamma_identified, readout_params
 
 
 def np_loss(gamma, alpha, beta, eps, x):
@@ -161,3 +161,13 @@ def test_l1_zeros_survive_the_polish():
     theta, _ = fit_scaling_law(jnp.asarray(D), jnp.asarray(L), None, K=D.shape[0], l1=1e6)
     g, *_ = readout_params(theta, D.shape[0])
     assert np.allclose(g, np.eye(D.shape[0]))
+
+
+def test_gamma_identified_guard():
+    K = 3
+    log_gamma = np.log(np.maximum(np.array([[1.0, 0.5, 0.0], [0.0, 1.0, 0.0], [0.0, 20.0, 1.0]]), 1e-12))
+    theta = jnp.asarray(np.concatenate([log_gamma.ravel(), np.full(K, 0.3), np.zeros(K), np.zeros(K)]))
+    assert gamma_identified(theta, K, n_points=100)
+    assert not gamma_identified(theta, K, n_points=100, gamma_max=10.0)
+    assert not gamma_identified(theta, K, n_points=20, min_points=50)
+    assert not gamma_identified(jnp.full_like(theta, jnp.nan), K, n_points=100)

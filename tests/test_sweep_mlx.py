@@ -6,6 +6,7 @@ from omegaconf import OmegaConf
 
 from scripts.sweep_mlx import ARMS, commands, run_summary, summarize, tie_flags
 from src.data_selectors.episelect import EpiSelect
+from src.scaling_law import readout_params
 from src.scaling_law_paper import _log_loss as paper_log_loss
 from tests.test_scaling_law import _synthetic
 
@@ -66,7 +67,7 @@ def test_commands_cover_every_arm_and_seed():
     assert "loader=mlx_natural" in cmd and "seed=0" in cmd and cmd[-1] == "data_dir=/d"
 
 
-def _selector(fit_method):
+def _selector(fit_method, **kwargs):
     return EpiSelect(
         n_task=4,
         task_token_count=np.ones(4),
@@ -84,6 +85,7 @@ def _selector(fit_method):
         tau=1.0,
         y_axis="val_loss",
         fit_method=fit_method,
+        **kwargs,
     )
 
 
@@ -105,3 +107,24 @@ def test_paper_fit_method_drives_the_selector():
     assert np.isclose(metrics["param_gamma/task0_from0"], 1.0)
     p = sel.curr_dist(itr=10)
     assert np.isclose(p.sum(), 1.0) and (p > 0).all()
+
+
+def _feed(sel, D, L):
+    # val-loss fitting on a run's evals: one eval per step
+    sel.task_cnt_TxK = np.diff(np.concatenate([np.zeros((D.shape[0], 1)), D], 1), axis=1).T.astype(np.int64)
+    sel.val_loss_SxK = L.T.astype(np.float32)
+    sel.val_step_S = np.arange(D.shape[1])
+
+
+def test_guard_falls_back_to_identity_with_too_few_points():
+    D, L, *_ = _synthetic(T=30)
+    sel = _selector("own", min_fit_points=50)
+    _feed(sel, D, L)
+    params = sel.compute_scaling_law_params()
+    assert sel.gamma_guarded and np.allclose(readout_params(params, 4)[0], np.eye(4))
+    # enough points: the transfer weights are kept
+    D, L, *_ = _synthetic(T=200)
+    sel = _selector("own", min_fit_points=50, gamma_max=10.0)
+    _feed(sel, D, L)
+    params = sel.compute_scaling_law_params()
+    assert not sel.gamma_guarded and readout_params(params, 4)[0][0, 1] > 0.2

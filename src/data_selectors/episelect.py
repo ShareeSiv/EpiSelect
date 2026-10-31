@@ -10,7 +10,7 @@ from scipy.signal import savgol_filter
 
 from src import scaling_law_paper
 from src.data_selectors.ado import AdoSelector, clip_min_probability
-from src.scaling_law import epiplexity_grads, fit_scaling_law, readout_params
+from src.scaling_law import IDENTITY_L1, epiplexity_grads, fit_scaling_law, gamma_identified, readout_params
 
 
 class EpiSelect(AdoSelector):
@@ -35,6 +35,8 @@ class EpiSelect(AdoSelector):
         alpha_min_halfwidth=0.05,
         fit_data_path=None,
         fit_method="own",  # own | paper
+        min_fit_points=0,
+        gamma_max=float("inf"),
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -63,6 +65,11 @@ class EpiSelect(AdoSelector):
         if fit_method not in ("own", "paper"):
             raise ValueError(f"Unrecognized fit_method: {fit_method}. Options: ['own', 'paper']")
         self.fit_method = fit_method
+        # own fit only: below min_fit_points points, or with any off-diagonal gamma above gamma_max, gamma is not
+        # trusted and the refit uses the gamma = I law instead (alpha, beta, eps refit to match)
+        self.min_fit_points = min_fit_points
+        self.gamma_max = gamma_max
+        self.gamma_guarded = False
 
         self.fit_val = None
         self.gamma_spread = None
@@ -95,6 +102,7 @@ class EpiSelect(AdoSelector):
         metrics["fit_val"] = float(self.fit_val)
         metrics["gamma_spread"] = float(self.gamma_spread)
         metrics["fit_cond"] = float(self.fit_cond)
+        metrics["gamma_guarded"] = float(self.gamma_guarded)
         metrics["alpha_range_width"] = float(np.mean(self.alpha_hi - self.alpha_lo))
         params = self.current_params
         if self.fit_method == "paper":  # log gamma with own weight 1 for both fits, so they compare directly
@@ -143,6 +151,12 @@ class EpiSelect(AdoSelector):
         if self.fit_method == "paper":
             self.gamma_spread = np.nan  # state[1] is the lbfgs iteration count
             return params
+        self.gamma_guarded = not gamma_identified(params, self.k, T, self.min_fit_points, self.gamma_max)
+        if self.gamma_guarded:
+            print(f"gamma not identified ({T} points); refitting with gamma = I.")
+            params_Kx3pK, state = self._fit_scaling_law_fn(l1=IDENTITY_L1)(cum_cnt_KxT, task_loss_KxT)
+            self.fit_val, self.gamma_spread = state[0], state[1]
+            params = np.array(multihost_utils.process_allgather(params_Kx3pK, tiled=True))
         K2 = self.k * self.k
         log_gamma = params[:K2].reshape(self.k, self.k)
         if self.gamma_identity:
@@ -169,14 +183,14 @@ class EpiSelect(AdoSelector):
         with opener(path, "wb") as f:
             np.savez(f, D=cum_cnt_KxT, L=task_loss_KxT)
 
-    def _fit_scaling_law_fn(self):
+    def _fit_scaling_law_fn(self, l1=None):
         if self.fit_method == "paper":
             return functools.partial(scaling_law_paper.fit_scaling_law, mesh=self.mesh, K=self.k)
         return functools.partial(
             fit_scaling_law,
             mesh=self.mesh,
             K=self.k,
-            l1=self.gamma_l1,
+            l1=self.gamma_l1 if l1 is None else l1,
             alpha_lo=jnp.asarray(self.alpha_lo, dtype=jnp.float32),
             alpha_hi=jnp.asarray(self.alpha_hi, dtype=jnp.float32),
             shared_alpha=self.shared_alpha,

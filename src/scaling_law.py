@@ -38,6 +38,17 @@ def readout_params(theta, K):
     return np.exp(log_gamma), np.array(alpha), np.exp(log_beta), np.exp(log_eps)
 
 
+IDENTITY_L1 = 1e6  # an l1 this large zeroes every off-diagonal weight: the gamma = I law, refit
+
+
+def gamma_identified(theta, K, n_points, min_points=0, gamma_max=np.inf):
+    # guard for early refits: with own weight 1 nothing bounds the off-diagonal weights, and with too few
+    # points they can run off along the alpha-gamma ridge (seen up to ~1e4 on synthetic runs)
+    gamma = readout_params(theta, K)[0]
+    off = gamma[~np.eye(K, dtype=bool)]
+    return bool(n_points >= min_points and np.isfinite(off).all() and off.max(initial=0.0) <= gamma_max)
+
+
 def epiplexity_grads(tokens, params):
     log_gamma, alpha, _, log_eps = _unpack(params, K=tokens.shape[0])
     gamma = np.exp(log_gamma)  # [K,K]
