@@ -1,0 +1,6 @@
+# kaggle_episelect with the paper's joint fit (row-simplex gamma); everything else is shared
+defaults:
+  - kaggle_episelect
+  - _self_
+
+fit_method: paper

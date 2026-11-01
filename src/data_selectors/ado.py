@@ -64,6 +64,40 @@ class AdoSelector:
             axis_names=("replica", "data"),
         )
 
+    # everything update() / curr_dist() carry from step to step, saved with each checkpoint so a resumed run
+    # continues the same curriculum (src/train.py)
+    STATE_KEYS = (
+        "current_params",
+        "task_cnt_TxK",
+        "task_loss_TxK",
+        "val_loss_SxK",
+        "val_cnt_SxK",
+        "val_step_S",
+        "p",
+        "p_avg",
+        "p_history",
+        "p_scaling",
+        "current_lr",
+        "tokens_remaining",
+        "remain_dist",
+        "train_epi_ceiling",
+        "train_total_nk",
+        "val_epi_ceiling",
+        "val_total_nk",
+    )
+
+    def state_dict(self):
+        def host(x):
+            return None if x is None else np.array(x) if isinstance(x, (np.ndarray, jax.Array)) else x
+
+        return {key: host(getattr(self, key)) for key in self.STATE_KEYS}
+
+    def load_state_dict(self, state):
+        missing = set(self.STATE_KEYS) - set(state)
+        assert not missing, f"selector state is missing {sorted(missing)}"
+        for key in self.STATE_KEYS:
+            setattr(self, key, state[key])
+
     def curr_dist(self, itr):
         # dL_k/dn = alpha_k * (L_k - irreducible_k) / n_k, normalized over k
         if itr < self.start_step or self.current_params is None:

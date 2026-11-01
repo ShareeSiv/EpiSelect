@@ -1,5 +1,6 @@
 import json
 import os
+import uuid
 from datetime import datetime
 
 import gcsfs
@@ -54,7 +55,7 @@ def main(cfg=None):
                 with fopen(wandb_id_path, "r") as f:
                     wandb_id = f.read()
             else:
-                wandb_id = wandb.util.generate_id()
+                wandb_id = uuid.uuid4().hex[:8]  # wandb.util.generate_id is gone in wandb>=0.26
                 with fopen(wandb_id_path, "w") as f:
                     f.write(wandb_id)
 

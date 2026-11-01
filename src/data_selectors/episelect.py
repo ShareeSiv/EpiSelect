@@ -1,4 +1,5 @@
 import functools
+import os
 
 import gcsfs
 import jax
@@ -75,6 +76,15 @@ class EpiSelect(AdoSelector):
         self.gamma_spread = None
         self.fit_cond = None
 
+    STATE_KEYS = AdoSelector.STATE_KEYS + (
+        "alpha_lo",
+        "alpha_hi",
+        "gamma_guarded",
+        "fit_val",
+        "gamma_spread",
+        "fit_cond",
+    )
+
     def curr_dist(self, itr):
         if itr < self.start_step or self.current_params is None:
             return None
@@ -138,8 +148,7 @@ class EpiSelect(AdoSelector):
         cols = np.asarray(cum_cnt_KxT, dtype=np.float64).T
         self.fit_cond = np.linalg.cond(cols / np.maximum(cols.max(axis=0), 1.0))
         cum_cnt_KxT, task_loss_KxT = multihost_utils.broadcast_one_to_all((cum_cnt_KxT, task_loss_KxT))
-        if self.fit_data_path and jax.process_index() == 0:
-            self._dump_fit_data(np.asarray(cum_cnt_KxT), np.asarray(task_loss_KxT))
+        fit_data = (np.asarray(cum_cnt_KxT), np.asarray(task_loss_KxT))
 
         sharding = jax.sharding.NamedSharding(self.mesh, P())
         cum_cnt_KxT = self._make_global_array(cum_cnt_KxT, sharding)
@@ -150,6 +159,7 @@ class EpiSelect(AdoSelector):
         params = np.array(multihost_utils.process_allgather(params_Kx3pK, tiled=True))
         if self.fit_method == "paper":
             self.gamma_spread = np.nan  # state[1] is the lbfgs iteration count
+            self._dump_fit_data(*fit_data, params)
             return params
         self.gamma_guarded = not gamma_identified(params, self.k, T, self.min_fit_points, self.gamma_max)
         if self.gamma_guarded:
@@ -167,6 +177,7 @@ class EpiSelect(AdoSelector):
             log_gamma = np.log(np.maximum(new, 1e-12))
         params[:K2] = log_gamma.reshape(-1)
         self._narrow_alpha_range(params[K2 : K2 + self.k])
+        self._dump_fit_data(*fit_data, params)
         return params
 
     def _narrow_alpha_range(self, alpha_K):
@@ -176,12 +187,29 @@ class EpiSelect(AdoSelector):
         self.alpha_lo = np.clip(alpha_K - half, 0.01, None)
         self.alpha_hi = np.clip(alpha_K + half, None, 1.0)
 
-    def _dump_fit_data(self, cum_cnt_KxT, task_loss_KxT):
-        # path may contain {step}, e.g. gs://bucket/run/fit_data_{step}.npz
+    def _dump_fit_data(self, cum_cnt_KxT, task_loss_KxT, params):
+        # the refit's (D, L) and the law it chose. path may contain {step}, e.g. gs://bucket/run/fit_data_{step}.npz.
+        # params are in the fit's own parametrisation (fit_method); params_own has gamma_mm = 1 for both fits
+        if not self.fit_data_path or jax.process_index() != 0:
+            return
         path = self.fit_data_path.format(step=self.task_cnt_TxK.shape[0])
-        opener = gcsfs.GCSFileSystem().open if path.startswith("gs://") else open
+        params = np.asarray(params)
+        params_own = np.asarray(scaling_law_paper.to_own_weight(params, self.k)) if self.fit_method == "paper" else params
+        if path.startswith("gs://"):
+            opener = gcsfs.GCSFileSystem().open
+        else:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            opener = open
         with opener(path, "wb") as f:
-            np.savez(f, D=cum_cnt_KxT, L=task_loss_KxT)
+            np.savez(
+                f,
+                D=cum_cnt_KxT,
+                L=task_loss_KxT,
+                params=params,
+                params_own=params_own,
+                fit_method=self.fit_method,
+                gamma_guarded=self.gamma_guarded,
+            )
 
     def _fit_scaling_law_fn(self, l1=None):
         if self.fit_method == "paper":

@@ -42,6 +42,14 @@ python launch.py +experiment=124M/EpiSelect \
 ./scripts/tpu_launch.sh 124M/EpiSelect gs://your-bucket/commonpile_tfds gs://your-bucket/checkpoints
 ```
 
+## 124M on a Kaggle TPU v5e-8
+
+`kaggle/` pretrains the paper's 124M model with the own-weight-1 fit (and optionally the paper's fit) on Kaggle's free
+TPU v5e-8. It uses a compact uint16 corpus (`scripts/build_compact_commonpile.py`, `src/dataloader/compact_loader.py`)
+and resumes exactly across 9-hour sessions: the selector state is checkpointed with the model, and `time_budget_h`
+stops a run cleanly. `scripts/gamma_report.py` compares the fitted gamma matrices and the zero-shot accuracy with
+Table 1. See [`kaggle/README.md`](kaggle/README.md).
+
 ## Small models on a Mac (MLX)
 
 `scripts/train_mlx.py` trains 5-20M-parameter models on the Apple-silicon GPU with MLX (`src/mlx_model.py`, a port of `src/model.py`), using the same loaders, data selectors, WSD schedule and exploration options as the JAX path. The default config (`configs/mlx.yaml`) trains a 10M model on 8 domains for 12k steps x 32 x 256 = 98M tokens, about an hour on an M5 Pro.

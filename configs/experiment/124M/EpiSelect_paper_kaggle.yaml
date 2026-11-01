@@ -1,0 +1,16 @@
+# @package _global_
+# 124M on a kaggle TPU v5e-8 (one host, 8 chips), paper fit. Paper schedule: 60k steps x 256 x 1024 tokens.
+# batch_size is per micro-step: 128 x g_accum_iters 2 = 256 sequences per step, as in the paper
+defaults:
+  - override /model: 124M
+  - override /loader: kaggle_episelect_paper
+seed: 21
+multihost: false
+data_format: compact
+batch_size: 128
+g_accum_iters: 2
+eval_batch_size: 128
+ckpt_keep: 2
+time_budget_h: 8.4   # kaggle sessions stop at 9 h; leaves time to save and copy outputs
+pbar_full_metrics: false  # metrics still go to wandb
+pbar_mininterval: 60
