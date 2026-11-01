@@ -66,6 +66,8 @@ Use the accelerator value Kaggle lists for the TPU it offers. Kaggle's CLI docs 
 
 For the paper-fit arm, use a second notebook id (for example `episelect-124m-paper`) so the two arms' outputs never mix.
 
+**Internet must be on.** The notebook clones this repo, installs dependencies and downloads the LM-Eval tasks. Kaggle only allows internet for phone-verified accounts (Settings → Phone verification). Without it, the first cell stops with `github.com does not resolve`.
+
 Either way, set the notebook up like this:
 
 - Accelerator: **TPU v5e-8 or v6e-8**.
