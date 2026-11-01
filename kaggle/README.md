@@ -1,6 +1,6 @@
-# 124M EpiSelect on Kaggle (TPU v5e-8)
+# 124M EpiSelect on Kaggle (TPU v5e-8 or v6e-8)
 
-This pretrains the paper's 124M model with the **own-weight-1 scaling-law fit** on Kaggle's free TPU v5e-8, then compares it with the paper on two things:
+This pretrains the paper's 124M model with the **own-weight-1 scaling-law fit** on Kaggle's free TPU (v5e-8, or v6e-8 if that is what Kaggle offers), then compares it with the paper on two things:
 
 - **Downstream accuracy.** Zero-shot LM-Eval scores against the paper's Table 1. For 124M the paper reports Natural 0.377, ADO 0.379 and EpiSelect 0.394.
 - **The fitted γ_{m,k} matrix.** Compared against the paper's joint fit, either from a second run trained with that fit, or by replaying our run's data through it.
@@ -38,9 +38,37 @@ Make the datasets private. After uploading, start one `bench` version to check t
 
 ## 2. Notebook
 
-Create a Kaggle notebook from `kaggle/train_124m.ipynb` and set it up:
+Kaggle runs notebooks, and this one is `kaggle/train_124m.ipynb`. Kaggle does not pick it up from GitHub on its own, so get it there one of two ways.
 
-- Accelerator: **TPU v5e-8**.
+**In the browser.** On kaggle.com choose Create → New Notebook, then File → Import Notebook, and paste the GitHub URL of `kaggle/train_124m.ipynb` (or upload the file).
+
+**From the command line.** In `kaggle/kernel-metadata.json`:
+
+- replace `YOUR_KAGGLE_USERNAME` in `id`;
+- list your corpus datasets in `dataset_sources`, for example `"you/commonpile-compact-part1"`;
+- to resume, put the notebook itself (`"you/episelect-124m"`) in `kernel_sources`, so the previous version's output is attached.
+
+Then push it and follow it:
+
+```bash
+kaggle kernels push -p kaggle --accelerator TpuV6E8
+```
+
+```bash
+kaggle kernels status YOUR_KAGGLE_USERNAME/episelect-124m
+```
+
+```bash
+kaggle kernels output YOUR_KAGGLE_USERNAME/episelect-124m -p out/
+```
+
+Use the accelerator value Kaggle lists for the TPU it offers. Kaggle's CLI docs list `TpuV6E8`; I found no listed value for v5e-8. A v6e-8 is faster and has 32 GB of memory per chip, so the configs still work, and `bench` shows the real speed. Each push runs the notebook as a new version.
+
+For the paper-fit arm, use a second notebook id (for example `episelect-124m-paper`) so the two arms' outputs never mix.
+
+Either way, set the notebook up like this:
+
+- Accelerator: **TPU v5e-8 or v6e-8**.
 - Internet: on.
 - Add your corpus dataset(s) as input.
 - Optional: add `WANDB_API_KEY` under Add-ons → Secrets. Without it, wandb logs offline into the output.

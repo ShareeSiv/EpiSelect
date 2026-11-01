@@ -1,0 +1,15 @@
+{
+  "id": "YOUR_KAGGLE_USERNAME/episelect-124m",
+  "title": "episelect-124m",
+  "code_file": "train_124m.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": true,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": []
+}
