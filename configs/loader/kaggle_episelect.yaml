@@ -1,0 +1,11 @@
+# commonpile_episelect (own-weight-1 fit, the paper's refit schedule) on the compact corpus, for the kaggle 124M run.
+# every refit's (D, L) and fitted law go to fit_data/ for scripts/gamma_report.py
+defaults:
+  - commonpile_episelect
+  - _self_
+
+tasks_sampler_cfg:
+  _target_: src.dataloader.compact_loader.CompactTasksSampler
+  seed: 0                # replaced by the run's seed
+fit_data_path: ${rundir}/fit_data/fit_data_{step}.npz
+fit_method: own

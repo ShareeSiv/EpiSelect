@@ -29,6 +29,14 @@ compute_dtype: bfloat16
 shard_model: false
 
 eval_interval: 1000
+eval_batch_size: null  # null = batch_size
+
+data_format: tfds      # tfds (common_pile_grouped) | compact (uint16 memmaps, scripts/build_compact_commonpile.py)
+ckpt_keep: null        # model checkpoints to keep, null = all
+time_budget_h: null    # stop cleanly (checkpointed) after this many hours, e.g. a kaggle session; rerun to resume
+allow_selector_reset: false  # resume even if the selector state for the checkpoint is missing
+pbar_full_metrics: true      # every metric in the progress bar (false: loss, lr, val loss)
+pbar_mininterval: 0.1        # seconds between progress bar refreshes
 
 hydra:
   output_subdir: null

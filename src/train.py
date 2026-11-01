@@ -1,5 +1,7 @@
+import glob
 import json
 import os
+import pickle
 import time
 import typing as tp
 from functools import partial
@@ -15,7 +17,6 @@ import wandb
 from jax.experimental import mesh_utils, multihost_utils
 from tqdm import trange
 
-from src.dataloader import commonpile_loader
 from src.dataloader.abstract import Loader
 from src.lr_schedule import make_lr_schedule, stable_end_step
 
@@ -95,7 +96,8 @@ def make_training_fns(
         taskid_np_N = np.zeros((0,), dtype=np.int32)
         # Capped at 150 batches: dataset sharding is uneven across hosts, and letting some
         # workers exhaust their shard before others deadlocks the allgather below
-        for taskid_B, seq_BxDp1 in dset.take(150).as_numpy_iterator():
+        batches = dset.take(150).as_numpy_iterator() if hasattr(dset, "take") else dset
+        for taskid_B, seq_BxDp1 in batches:
             x_1xBxD, y_1xBxD = seq_BxDp1[:, :-1][None], seq_BxDp1[:, 1:][None]
             x_1xBxD, y_1xBxD, taskid_1xB = jtu.tree_map(sharding_fn, (x_1xBxD, y_1xBxD, taskid_B[None]))
             _, loss_B = simple_loss(eval_model, x_1xBxD, y_1xBxD, None)
@@ -136,6 +138,62 @@ def _save_token_stats(train_sampler, config, itr):
             json.dump(stats, f, indent=2)
 
 
+def make_eval_set(config, tasks):
+    # data_format: tfds (common_pile_grouped, needs tensorflow) | compact (uint16 memmaps, scripts/build_compact_commonpile.py)
+    batch_size = config.get("eval_batch_size") or config.batch_size
+    if config.get("data_format", "tfds") == "compact":
+        from src.dataloader.compact_loader import CompactEvalSet
+
+        return CompactEvalSet(batch_size, config.block_size, config.loader.data_dir, tasks=tasks)
+    from src.dataloader import commonpile_loader
+
+    return commonpile_loader.make_eval_dset(batch_size, config.block_size, data_dir=config.loader.data_dir)
+
+
+def _selector_state_path(rundir, step):
+    return os.path.join(rundir, "selector_state", f"state_{step}_p{jax.process_index()}.pkl")
+
+
+def save_selector_state(train_sampler, rundir, step, keep):
+    # written next to each model checkpoint, so a resumed run continues the same curriculum. one file per host:
+    # hosts draw batches with their own rng. local rundirs only (the kaggle path); gs:// runs resume without it
+    if not hasattr(train_sampler, "state_dict") or rundir.startswith("gs://"):
+        return
+    path = _selector_state_path(rundir, step)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "wb") as f:
+        pickle.dump(train_sampler.state_dict(), f)
+    os.replace(path + ".tmp", path)
+    old = sorted(
+        glob.glob(os.path.join(os.path.dirname(path), f"state_*_p{jax.process_index()}.pkl")),
+        key=lambda q: int(os.path.basename(q).split("_")[1]),
+    )
+    for q in old[: -(keep + 1)] if keep else []:
+        os.remove(q)
+
+
+def load_selector_state(train_sampler, rundir, step):
+    if not hasattr(train_sampler, "load_state_dict") or rundir.startswith("gs://"):
+        return False
+    path = _selector_state_path(rundir, step)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"model checkpoint {step} has no selector state at {path}: resuming would restart the curriculum. "
+            "Delete the checkpoint to resume from an earlier one, or set allow_selector_reset=true."
+        )
+    with open(path, "rb") as f:
+        train_sampler.load_state_dict(pickle.load(f))
+    print(f"Restored selector state from step {step}.")
+    return True
+
+
+def _write_status(config, step, finished, reason):
+    if config.debug or jax.process_index() != 0 or config.rundir.startswith("gs://"):
+        return
+    with open(os.path.join(config.rundir, "run_status.json"), "w") as f:
+        json.dump({"last_step": step, "max_steps": config.max_steps, "finished": finished, "reason": reason}, f)
+
+
 def train(config):
     n_devices = jax.device_count()
     local_cnt = jax.local_device_count()
@@ -145,13 +203,14 @@ def train(config):
         axis_names=("replica", "data"),
     )
 
-    val_dset = commonpile_loader.make_eval_dset(config.batch_size, config.block_size, data_dir=config.loader.data_dir)
-
+    start_time = time.time()
+    time_budget_s = config.get("time_budget_h") and 3600 * config.time_budget_h
+    ckpt_keep = config.get("ckpt_keep")  # null keeps every checkpoint
     if not config.debug:
         mngr = ocp.CheckpointManager(
             config.rundir,
             ocp.AsyncCheckpointer(ocp.PyTreeCheckpointHandler()),
-            options=ocp.CheckpointManagerOptions(max_to_keep=None, save_interval_steps=config.eval_interval),
+            options=ocp.CheckpointManagerOptions(max_to_keep=ckpt_keep, save_interval_steps=config.eval_interval),
         )
 
     scheduler = make_lr_schedule(config)
@@ -209,6 +268,15 @@ def train(config):
         seed=config.seed,
     )
     print(f"Training over {train_sampler.tasks_sampler.tasks} domains.")
+    val_dset = make_eval_set(config, train_sampler.tasks_sampler.tasks)
+
+    if first_step > 0:
+        try:
+            load_selector_state(train_sampler, config.rundir, first_step - 1)
+        except FileNotFoundError:
+            if not config.get("allow_selector_reset", False):
+                raise
+            print("WARNING: no selector state; the curriculum restarts from the initial distribution.")
 
     pbar = trange(
         first_step,
@@ -216,9 +284,14 @@ def train(config):
         initial=first_step,
         total=config.max_steps,
         disable=jax.process_index() != 0,
+        mininterval=config.get("pbar_mininterval", 0.1),
     )
     is_main = jax.process_index() == 0
+    timed_from = first_step + 20  # throughput summary skips compilation and the first steps
+    t_timed = None
     for itr in pbar:
+        if itr == timed_from:
+            t_timed = time.time()
         metrics = {}
         if itr % config.eval_interval == 0:
             loss_np_N, taskid_np_N, val_metrics = evaluate(model, val_dset)
@@ -233,8 +306,15 @@ def train(config):
         model, opt_state, loss, loss_GxB = step(model, opt_state, x_GxBxD, y_GxBxD, key1)
         metrics.update({f"opt_{k}": v for k, v in train_sampler.update(loss_GxB, info, itr, lr=get_lr(opt_state).item()).items()})
 
+        # always save the last step, and stop cleanly (saved) once the wall-clock budget is spent, e.g. at the
+        # end of a kaggle session; rerunning with the same rundir resumes from here
+        last = itr == config.max_steps - 1
+        out_of_time = bool(time_budget_s) and time.time() - start_time > time_budget_s and not last
         if not config.debug:
-            mngr.save(itr, (jtu.tree_leaves(model), jtu.tree_leaves(opt_state)))
+            force = last or out_of_time
+            if force or mngr.should_save(itr):
+                mngr.save(itr, (jtu.tree_leaves(model), jtu.tree_leaves(opt_state)), force=force)
+                save_selector_state(train_sampler, config.rundir, itr, ckpt_keep)
         metrics["loss/opt"] = loss.item()
         metrics["lr"] = get_lr(opt_state).item()
 
@@ -243,8 +323,28 @@ def train(config):
                 tok_per_step = config.batch_size * config.g_accum_iters * config.block_size
                 metrics["perf/tps"] = pbar.format_dict["rate"] * tok_per_step
             wandb.log(metrics, step=itr)
-        pbar.set_postfix(**metrics)
+        if config.get("pbar_full_metrics", True):
+            pbar.set_postfix(**metrics)
+        else:  # a few hundred metrics per update floods long notebook logs
+            pbar.set_postfix({k: metrics[k] for k in ("loss/opt", "lr", "val_balanced_loss") if k in metrics})
+        if out_of_time:
+            print(f"Time budget of {config.time_budget_h} h spent: stopping after step {itr} (checkpointed).")
+            break
 
     pbar.close()
+    if t_timed is not None and is_main:
+        n = itr - timed_from + 1
+        sec = (time.time() - t_timed) / n
+        tok = config.batch_size * config.g_accum_iters * config.block_size
+        mem = jax.local_devices()[0].memory_stats() or {}
+        peak = mem.get("peak_bytes_in_use", 0) / 2**30
+        limit = mem.get("bytes_limit", 0) / 2**30
+        print(
+            f"Throughput over {n} steps: {sec:.3f} s/step, {tok / sec:,.0f} tokens/s; "
+            f"{config.max_steps} steps would take {config.max_steps * sec / 3600:.2f} h. "
+            f"Peak memory on device 0: {peak:.2f} / {limit:.2f} GiB."
+        )
     if not config.debug:
         mngr.wait_until_finished()
+        finished = mngr.latest_step() == config.max_steps - 1
+        _write_status(config, mngr.latest_step(), finished, "done" if finished else "time_budget")

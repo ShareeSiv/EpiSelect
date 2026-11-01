@@ -103,7 +103,11 @@ class AdaptiveLoader(Loader):
             concentration=explore_concentration,
         )
 
-        self.tasks_sampler: TasksSampler = hydra.utils.instantiate(tasks_sampler_cfg, split, block_size, data_dir)
+        # samplers with their own rng (the compact sampler) take the run's seed
+        sampler_kwargs = {"seed": seed} if "seed" in tasks_sampler_cfg else {}
+        self.tasks_sampler: TasksSampler = hydra.utils.instantiate(
+            tasks_sampler_cfg, split, block_size, data_dir, **sampler_kwargs
+        )
         self.k = self.tasks_sampler.k
         task_token_count = self.tasks_sampler.total_token_n if mode == "empirical" else np.ones(self.k)
 
@@ -174,6 +178,27 @@ class AdaptiveLoader(Loader):
         task_ids_GxB = task_ids_BG.reshape(self.g_accum_iters, B)
         info = {"task_ids": task_ids_GxB[..., None], "p": task_probs_K[task_ids_GxB][..., None]}
         return jax.tree_util.tree_map(self.sharding_fn, (x_GxBxT, y_GxBxT, info))
+
+    def state_dict(self):
+        # everything a resumed run needs to continue the same curriculum: the selector's loss/count history and
+        # fitted law, the current distribution, the batch rng and the sampler's position in each domain
+        state = {
+            "cumulative_cnts": dict(self.cumulative_cnts),
+            "curr_dist0": None if self._curr_dist0 is None else np.asarray(self._curr_dist0),
+            "rng": self.rng.bit_generator.state,
+            "data_policy": self.data_policy.state_dict(),
+        }
+        if hasattr(self.tasks_sampler, "state_dict"):
+            state["tasks_sampler"] = self.tasks_sampler.state_dict()
+        return state
+
+    def load_state_dict(self, state):
+        self.cumulative_cnts = Counter(state["cumulative_cnts"])
+        self._curr_dist0 = state["curr_dist0"]
+        self.rng.bit_generator.state = state["rng"]
+        self.data_policy.load_state_dict(state["data_policy"])
+        if "tasks_sampler" in state and hasattr(self.tasks_sampler, "load_state_dict"):
+            self.tasks_sampler.load_state_dict(state["tasks_sampler"])
 
     def update_val_loss(self, loss_np_N, taskid_np_N, step: int):
         self.data_policy.update_val_loss(loss_np_N, taskid_np_N, step)

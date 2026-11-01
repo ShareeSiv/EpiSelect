@@ -19,7 +19,7 @@ from datasets import load_dataset
 from jax.experimental import mesh_utils
 from lm_eval.evaluator import simple_evaluate
 from lm_eval.tasks import TaskManager
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from transformers import AutoTokenizer
 
 from src.dataloader.commonpile_loader import make_tfds_dataset
@@ -48,11 +48,8 @@ def _rundir_exists(rundir):
 
 
 def _namespace(d):
-    # rebuild the training config from cfg.json as an attribute-access object
-    ns = type("C", (), {})()
-    for k, v in d.items():
-        setattr(ns, k, _namespace(v) if isinstance(v, dict) else v)
-    return ns
+    # the training config from cfg.json, with attribute access and .get (make_lr_schedule uses both)
+    return OmegaConf.create(d)
 
 
 def _load_model(rundir, mesh, cfg):
@@ -221,7 +218,15 @@ def main(cfg: DictConfig):
         # The builder defines only `train` and `val` (src/tfds/common_pile_grouped.py),
         # so `val` is the only held-in split available to score
         if "val" in evals:
-            rd["val"] = _eval_commonpile(model, eval_fn, "val", cfg.data_dir, run_cfg.batch_size, run_cfg.block_size)
+            if getattr(run_cfg, "data_format", "tfds") == "compact":  # the kaggle runs: same val set as training
+                from src.dataloader.compact_loader import CompactEvalSet
+
+                tasks = getattr(run_cfg.loader.tasks_sampler_cfg, "tasks", None)
+                bs = getattr(run_cfg, "eval_batch_size", None) or run_cfg.batch_size
+                _, _, m = eval_fn(model, CompactEvalSet(bs, run_cfg.block_size, cfg.data_dir, tasks=tasks))
+                rd["val"] = {k: float(v) for k, v in m.items()}
+            else:
+                rd["val"] = _eval_commonpile(model, eval_fn, "val", cfg.data_dir, run_cfg.batch_size, run_cfg.block_size)
 
         inf_model = eqx.Partial(cast_pytree(model, jnp.float32), inference=True)
         for name, tokens in ood_tokens.items():

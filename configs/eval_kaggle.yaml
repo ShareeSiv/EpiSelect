@@ -1,0 +1,29 @@
+# kaggle 124M runs: python -m src.eval --config-name eval_kaggle data_dir=/kaggle/input/<dataset>
+# zero-shot harness tasks of Table 1 (ARC = arc_challenge) plus the compact Common Pile val set
+defaults:
+  - eval
+  - _self_
+
+runs:
+  - label: EpiSelect own fit
+    path: /kaggle/working/run
+
+evals:
+  - val
+  - harness
+
+harness_tasks:
+  - arc_challenge
+  - bbq
+  - boolq
+  - commonsense_qa
+  - hellaswag
+  - lambada_openai
+  - openbookqa
+  - piqa
+  - sciq
+  - winogrande
+
+data_dir: /kaggle/input
+ood_cache_dir: /kaggle/working/ood_cache
+output: /kaggle/working/eval_results.json
