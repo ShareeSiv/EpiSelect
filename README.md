@@ -42,6 +42,30 @@ python launch.py +experiment=124M/EpiSelect \
 ./scripts/tpu_launch.sh 124M/EpiSelect gs://your-bucket/commonpile_tfds gs://your-bucket/checkpoints
 ```
 
+## 124M on NVIDIA GPUs (Vast.ai, RunPod)
+
+`configs/experiment/124M/EpiSelect_own_nvidia.yaml` is the paper's 124M EpiSelect run (same model, the 31 Common Pile domains, seed 21, 60k steps x 256 x 1024 = 15.7B tokens, cosine schedule, refit every 1,000 steps) with the own-weight-1 fit, on one GPU host. `loader.fit_method=paper` runs the paper's fit on the same hardware.
+
+1. **Tokenize once, off the GPU box.** The tfds build stores GPT-NeoX-20B token ids as int32, so training never tokenizes. Build on a cheap many-core CPU instance and push it to storage:
+   ```bash
+   bash requirements.sh && bash scripts/gpu/build_data.sh /data/commonpile_tfds 16
+   bash scripts/gpu/sync.sh /data/commonpile_tfds r2:bucket/commonpile_tfds   # local, gs://, s3:// or any rclone remote
+   ```
+2. **On the GPU box** (needs a CUDA 12 driver and ~250 GB disk: 95 GB of data plus checkpoints):
+   ```bash
+   bash scripts/gpu/setup.sh
+   bash scripts/gpu/sync.sh r2:bucket/commonpile_tfds /data/commonpile_tfds
+   export WANDB_API_KEY=...
+   MICRO_BS=32 bash scripts/gpu/launch_124M.sh /data/commonpile_tfds /data/runs/124M_EpiSelect_own
+   ```
+   `MICRO_BS` is the sequences each GPU processes per forward and backward pass: 32 for 80 GB, 16 for 40-48 GB, 8 for 24 GB. The script uses gradient accumulation to make up the rest, so every step is still 256 sequences, and the domain draws are the same for any GPU count. The val set stays at the paper's 150 x 256 sequences (`eval_batch_size`), evaluated in chunks of `eval_microbatch`. Only the last 3 checkpoints are kept (`ckpt_max_to_keep`). Each one is about 1.5 GB.
+3. Copy the run back: `bash scripts/gpu/sync.sh /data/runs/124M_EpiSelect_own <remote>`. It holds the checkpoints, `fit_data_*.npz` for `scripts/compare_fits.py` and `token_stats.json`.
+
+Things to know before renting:
+- **Use an on-demand (non-interruptible) instance.** Resuming restores the model and optimizer, but not the selector's loss history or the data iterators. After a restart, EpiSelect refits on a fresh history, so a resumed run no longer matches an uninterrupted one.
+- Seed 21 makes the initialization identical to the paper's, because JAX's threefry RNG is platform-independent. The run is not bit-identical, because GPU kernels and bf16 rounding differ from TPU, and the paper's run sharded the tf.data streams across TPU hosts. Expect a close match, not an exact one, and compare against `fit_method=paper` on the same GPUs for a like-for-like difference.
+- bf16 compute needs an Ampere or newer GPU (A100, A6000, L40S, RTX 3090/4090, H100).
+
 ## Small models on a Mac (MLX)
 
 `scripts/train_mlx.py` trains 5-20M-parameter models on the Apple-silicon GPU with MLX (`src/mlx_model.py`, a port of `src/model.py`), using the same loaders, data selectors, WSD schedule and exploration options as the JAX path. The default config (`configs/mlx.yaml`) trains a 10M model on 8 domains for 12k steps x 32 x 256 = 98M tokens, about an hour on an M5 Pro.

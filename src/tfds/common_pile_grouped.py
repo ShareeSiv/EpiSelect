@@ -6,6 +6,12 @@ import tensorflow_datasets as tfds
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
+# tf.data only feeds the host; without this a cuda-enabled tensorflow grabs gpu memory that jax needs
+try:
+    tf.config.set_visible_devices([], "GPU")
+except RuntimeError:  # devices already initialised
+    pass
+
 # changing any constant below requires bumping VERSION and rebuilding
 TOKEN_CAP = 2_000_000_000  # max tokens per domain
 VAL_FRACTION = 0.01

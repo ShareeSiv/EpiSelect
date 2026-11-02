@@ -96,12 +96,17 @@ def make_training_fns(
         # Capped at 150 batches: dataset sharding is uneven across hosts, and letting some
         # workers exhaust their shard before others deadlocks the allgather below
         for taskid_B, seq_BxDp1 in dset.take(150).as_numpy_iterator():
-            x_1xBxD, y_1xBxD = seq_BxDp1[:, :-1][None], seq_BxDp1[:, 1:][None]
-            x_1xBxD, y_1xBxD, taskid_1xB = jtu.tree_map(sharding_fn, (x_1xBxD, y_1xBxD, taskid_B[None]))
-            _, loss_B = simple_loss(eval_model, x_1xBxD, y_1xBxD, None)
-            loss_np_B, taskid_np_1xB = multihost_utils.process_allgather((loss_B, taskid_1xB), tiled=True)
-            loss_np_N = np.concatenate((loss_np_N, np.asarray(loss_np_B).reshape(-1)))
-            taskid_np_N = np.concatenate((taskid_np_N, np.asarray(taskid_np_1xB).reshape(-1)))
+            # the batch fixes which sequences are evaluated; the forward pass can run on smaller chunks
+            # (eval_microbatch) so a single gpu does not need the whole batch's logits in memory at once
+            chunk = config.get("eval_microbatch") or seq_BxDp1.shape[0]
+            for s in range(0, seq_BxDp1.shape[0], chunk):
+                seq_CxDp1, taskid_C = seq_BxDp1[s : s + chunk], taskid_B[s : s + chunk]
+                x_1xCxD, y_1xCxD = seq_CxDp1[:, :-1][None], seq_CxDp1[:, 1:][None]
+                x_1xCxD, y_1xCxD, taskid_1xC = jtu.tree_map(sharding_fn, (x_1xCxD, y_1xCxD, taskid_C[None]))
+                _, loss_C = simple_loss(eval_model, x_1xCxD, y_1xCxD, None)
+                loss_np_C, taskid_np_1xC = multihost_utils.process_allgather((loss_C, taskid_1xC), tiled=True)
+                loss_np_N = np.concatenate((loss_np_N, np.asarray(loss_np_C).reshape(-1)))
+                taskid_np_N = np.concatenate((taskid_np_N, np.asarray(taskid_np_1xC).reshape(-1)))
 
         metrics["empirical_loss"] = loss_np_N.mean()
         losses = []
@@ -139,19 +144,25 @@ def _save_token_stats(train_sampler, config, itr):
 def train(config):
     n_devices = jax.device_count()
     local_cnt = jax.local_device_count()
-    assert local_cnt in {1, 4, 8}, f"Unexpected local device count: {local_cnt}."
+    print(f"{jax.process_count()} host(s), {local_cnt} local / {n_devices} global {jax.devices()[0].platform} devices.")
+    assert config.batch_size % n_devices == 0, f"batch_size {config.batch_size} not divisible by {n_devices} devices."
     mesh = Mesh(
         mesh_utils.create_device_mesh((n_devices // local_cnt, local_cnt)),
         axis_names=("replica", "data"),
     )
 
-    val_dset = commonpile_loader.make_eval_dset(config.batch_size, config.block_size, data_dir=config.loader.data_dir)
+    # eval_batch_size fixes the validation set (150 batches of it), so keep it at the paper's 256 when
+    # batch_size is lowered for gradient accumulation
+    eval_bs = config.get("eval_batch_size") or config.batch_size
+    val_dset = commonpile_loader.make_eval_dset(eval_bs, config.block_size, data_dir=config.loader.data_dir)
 
     if not config.debug:
         mngr = ocp.CheckpointManager(
             config.rundir,
             ocp.AsyncCheckpointer(ocp.PyTreeCheckpointHandler()),
-            options=ocp.CheckpointManagerOptions(max_to_keep=None, save_interval_steps=config.eval_interval),
+            options=ocp.CheckpointManagerOptions(
+                max_to_keep=config.get("ckpt_max_to_keep"), save_interval_steps=config.eval_interval
+            ),
         )
 
     scheduler = make_lr_schedule(config)

@@ -1,0 +1,18 @@
+# @package _global_
+# The paper's 124M EpiSelect run (same model, data, seed and schedule) with the own-weight-1 fit,
+# on a single NVIDIA host. Launch with scripts/gpu/launch_124M.sh, which sets batch_size and
+# g_accum_iters from the GPU count so every step still sees 256 x 1024 tokens.
+# The paper's fit on the same hardware, for a like-for-like baseline: loader.fit_method=paper
+defaults:
+  - override /model: 124M
+  - override /loader: commonpile_episelect
+seed: 21
+tag: 124M-run-NVIDIA
+multihost: false
+
+eval_batch_size: 256  # the paper's val set (150 x 256 sequences), whatever batch_size is
+ckpt_max_to_keep: 3   # each checkpoint is ~1.5 GB (params + adam); every one would be ~90 GB
+
+loader:
+  fit_method: own
+  fit_data_path: ${rundir}/fit_data_{step}.npz  # for scripts/compare_fits.py afterwards
