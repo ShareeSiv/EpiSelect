@@ -16,23 +16,28 @@ OFFER = dict(
     inet_down=900,
     disk_space=500,
     geolocation="US",
+    inet_down_cost=0.002,  # $/GB
+    inet_up_cost=0.004,
 )
 
 
 def test_offer_query_parses_with_the_sdks_fields():
-    q = vast.offer_query(["H100 SXM", "RTX 4090"], 0.98, 200, max_price=3.0)
+    q = vast.offer_query(["H100 SXM", "RTX 4090"], 0.98, 200, max_price=3.0, max_bw_cost=2.048)
     assert "on-demand" not in q and "bid" not in q
     pq = pytest.importorskip("vastai.api.query")
     parsed = pq.parse_query(q, {}, pq.offers_fields, pq.offers_alias, pq.offers_mult)
     assert parsed["gpu_name"] == {"in": ["H100 SXM", "RTX 4090"]}
     assert parsed["num_gpus"] == {"eq": "1"} and parsed["dph_total"] == {"lte": "3.0"}
     assert parsed["cuda_max_good"] == {"gte": "12.6"} and parsed["compute_cap"] == {"gte": "800"}
+    assert parsed["inet_down_cost"] == {"lte": "0.002000"} and parsed["inet_up_cost"] == {"lte": "0.002000"}
 
 
 def test_estimate_and_table():
     hours, cost = vast.estimate(OFFER, build_data=False)
     assert hours == pytest.approx(vast.TOKENS / 400_000 / 3600 + vast.SETUP_HOURS)
-    assert cost == pytest.approx(hours * 2.4)
+    bw = vast.DOWN_GB["pull"] * 0.002 + vast.UP_GB * 0.004
+    assert vast.bandwidth_cost(OFFER, False) == pytest.approx(bw)
+    assert cost == pytest.approx(hours * 2.4 + bw)
     assert vast.estimate(OFFER, build_data=True)[0] == pytest.approx(hours + vast.BUILD_DATA_HOURS)
     assert vast.estimate({**OFFER, "gpu_name": "GTX 1080"}, False) == (None, None)
     assert "H100 SXM" in vast.format_offers([OFFER], False)

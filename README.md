@@ -100,9 +100,11 @@ python scripts/vast/vast.py status                  # stage, training progress, 
 python scripts/vast/vast.py watch --destroy         # when DONE: copy the run to ./vast_runs, then destroy
 ```
 
-- `offers` filters for 1 GPU, Ampere or newer, a CUDA >= 12.6 driver, reliability >= 0.98, >= 200 GB disk and fast
-  download. The cost column comes from guessed tokens/s per GPU (`TPS_GUESS` in `vast.py`). Replace the guesses with
-  your measured `perf/tps`.
+- `offers` filters for 1 GPU, Ampere or newer, a CUDA >= 12.6 driver, reliability >= 0.98, >= 200 GB disk, fast
+  download, and bandwidth at most $2/TB each way (`--max-bw-cost`; `0` for hosts that don't charge for it). The
+  `bw $` column is the bandwidth charge for this job: ~110 GB in when pulling the tokenized data (~250 GB when
+  tokenizing on the instance) and ~5 GB out. `est $` adds it to GPU time, which comes from guessed tokens/s per
+  GPU (`TPS_GUESS` in `vast.py`). Replace the guesses with your measured `perf/tps`.
 - `launch` always rents on-demand, never interruptible. The instance clones this branch at your pushed `HEAD` and
   runs the pipeline. A restarted container picks it up again, and a finished run is left alone.
 - **Data:** with `--data-src`, the instance pulls the tokenized data from an rclone remote, `s3://` or `gs://`.
@@ -114,6 +116,18 @@ python scripts/vast/vast.py watch --destroy         # when DONE: copy the run to
   `watch --destroy` (your machine must stay on), or `destroy` by hand.
 - The forwarded keys (W&B, HF, storage) are stored in the instance's environment, which the host can read. Use
   scoped or temporary keys.
+
+Keys and accounts:
+
+| What | Needed? | For |
+|---|---|---|
+| Vast.ai API key (`VAST_API_KEY`) | yes | renting and managing the instance |
+| SSH key registered on Vast (`vastai create ssh-key`) | yes | `status`, `fetch`, `watch`, `ssh` |
+| W&B API key (`WANDB_API_KEY`) | recommended | live curves; without it metrics only go to `metrics.jsonl` on the instance |
+| Hugging Face token (`HF_TOKEN`, read-only) | recommended | avoids rate limits when streaming Common Pile, the tokenizer and the harness datasets |
+| Storage keys (`RCLONE_CONFIG_*` or `AWS_*`) | only with `--data-src` / `--results-dst` | pulling the tokenized data, uploading results |
+
+No GitHub token is needed: the instance clones this public repository.
 
 Before renting:
 - **Use an on-demand (non-interruptible) instance.** A restart resumes the model and optimizer, but not the selector's

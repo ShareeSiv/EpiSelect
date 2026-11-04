@@ -49,6 +49,11 @@ TPS_GUESS = {
 }
 SETUP_HOURS = 0.5  # install, first compile, the Table 1 eval
 BUILD_DATA_HOURS = 1.5  # tokenizing on the instance when no DATA_SRC is given
+# traffic the job puts through the host's metered bandwidth (rough): pulling the ~95 GB tokenized build, or
+# streaming the raw Common Pile text to tokenize it there, plus the harness datasets; and the results going out
+DOWN_GB = {"pull": 110, "build": 250}
+UP_GB = 5  # run directory without checkpoints; checkpoints add ~2 GB each
+DEFAULT_MAX_BW_COST = 2.0  # $/TB, up or down
 
 # forwarded from your shell to the instance when set (values never printed)
 FORWARD_ENV = [
@@ -75,7 +80,7 @@ def client():
         sys.exit(f"{e}\nCreate one at https://console.vast.ai/manage-keys/")
 
 
-def offer_query(gpus, min_reliability, disk, max_price=None, min_cuda=12.6):
+def offer_query(gpus, min_reliability, disk, max_price=None, min_cuda=12.6, max_bw_cost=None):
     gpu_list = ",".join(g.replace(" ", "_") for g in gpus)
     q = (
         f"num_gpus=1 gpu_name in [{gpu_list}] reliability>={min_reliability} cuda_max_good>={min_cuda} "
@@ -83,28 +88,37 @@ def offer_query(gpus, min_reliability, disk, max_price=None, min_cuda=12.6):
     )
     if max_price is not None:
         q += f" dph_total<={max_price}"
+    if max_bw_cost is not None:  # $/TB on the command line, $/GB in the api
+        q += f" inet_down_cost<={max_bw_cost / 1024:.6f} inet_up_cost<={max_bw_cost / 1024:.6f}"
     return q
 
 
+def bandwidth_cost(offer, build_data):
+    down = DOWN_GB["build" if build_data else "pull"] * float(offer.get("inet_down_cost") or 0)
+    return down + UP_GB * float(offer.get("inet_up_cost") or 0)
+
+
 def estimate(offer, build_data):
-    # (hours, $) for the whole job on this offer, or (None, None) for a gpu without a throughput guess
+    # (hours, $) for the whole job on this offer, gpu time plus metered bandwidth, or (None, None) for a gpu
+    # without a throughput guess
     tps = TPS_GUESS.get(offer.get("gpu_name"))
     if not tps:
         return None, None
     hours = TOKENS / tps / 3600 + SETUP_HOURS + (BUILD_DATA_HOURS if build_data else 0)
-    return hours, hours * float(offer["dph_total"])
+    return hours, hours * float(offer["dph_total"]) + bandwidth_cost(offer, build_data)
 
 
 def format_offers(offers, build_data):
     rows = [
-        f"{'offer':>10}  {'gpu':<11} {'$/h':>6} {'rel':>6} {'cuda':>5} {'down':>6} {'disk':>5}  {'est h':>5} {'est $':>6}  location"
+        f"{'offer':>10}  {'gpu':<11} {'$/h':>6} {'rel':>6} {'cuda':>5} {'down':>6} {'disk':>5} {'bw $':>5}  {'est h':>5} {'est $':>6}  location"
     ]
     for o in offers:
         hours, cost = estimate(o, build_data)
         rows.append(
             f"{o['id']:>10}  {o.get('gpu_name', '?'):<11} {float(o['dph_total']):>6.3f} "
             f"{float(o.get('reliability', o.get('reliability2', 0))):>6.3f} {float(o.get('cuda_max_good', 0)):>5.1f} "
-            f"{float(o.get('inet_down', 0)):>6.0f} {float(o.get('disk_space', 0)):>5.0f}  "
+            f"{float(o.get('inet_down', 0)):>6.0f} {float(o.get('disk_space', 0)):>5.0f} "
+            f"{bandwidth_cost(o, build_data):>5.2f}  "
             f"{(f'{hours:.1f}' if hours else '?'):>5} {(f'{cost:.0f}' if cost else '?'):>6}  {o.get('geolocation', '')}"
         )
     return "\n".join(rows)
@@ -176,7 +190,7 @@ def remote_status(vast, iid):
 
 def cmd_offers(args):
     vast = client()
-    q = offer_query(args.gpus, args.min_reliability, args.disk, args.max_price)
+    q = offer_query(args.gpus, args.min_reliability, args.disk, args.max_price, max_bw_cost=args.max_bw_cost)
     offers = vast.search_offers(query=q, type="on-demand", order="dph_total", limit=args.limit, storage=args.disk)
     if not offers:
         print(f"no offers match: {q}")
@@ -187,7 +201,8 @@ def cmd_offers(args):
     print(format_offers(offers, args.build_data))
     print(
         f"\nest $ = (15.7B tokens / guessed tokens/s + {SETUP_HOURS} h setup/eval"
-        f"{f' + {BUILD_DATA_HOURS} h tokenizing' if args.build_data else ''}) x $/h. Guesses, not measurements."
+        f"{f' + {BUILD_DATA_HOURS} h tokenizing' if args.build_data else ''}) x $/h, plus bw $ (the host's metered\n"
+        f"bandwidth for ~{DOWN_GB['build' if args.build_data else 'pull']} GB in, ~{UP_GB} GB out). Guesses, not measurements."
     )
 
 
@@ -343,6 +358,12 @@ def main(argv=None):
     o.add_argument("--min-reliability", type=float, default=0.98)
     o.add_argument("--disk", type=int, default=200, help="GB: ~95 data + checkpoints + venv")
     o.add_argument("--max-price", type=float)
+    o.add_argument(
+        "--max-bw-cost",
+        type=float,
+        default=DEFAULT_MAX_BW_COST,
+        help="max $/TB the host charges for download or upload (0 = free bandwidth only)",
+    )
     o.add_argument("--limit", type=int, default=40)
     o.add_argument("--build-data", action="store_true", help="include tokenizing on the instance in the estimate")
     o.add_argument("--all", action="store_true", help="also show GPUs without a throughput guess")
