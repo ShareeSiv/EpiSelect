@@ -24,6 +24,7 @@ CFG = SimpleNamespace(vocab_size=64, n_layer=2, n_head=2, n_embd=32, dropout=0.0
 def _copy_jax_weights(mlx_model, jax_model):
     # blocks are stacked along a leading layer axis in the jax model
     mlx_model.wte.weight = mx.array(np.asarray(jax_model.wte.weight_VxD))
+    mlx_model.lm_head.weight = mx.array(np.asarray(jax_model.lm_head.weight_MxN))
     b = jax_model.blocks
     for i, block in enumerate(mlx_model.blocks):
         block.attn.c_attn.weight = mx.array(np.asarray(b.attn.c_attn.weight_MxN[i]))
@@ -60,6 +61,20 @@ def test_train_step_lowers_loss_and_returns_per_sequence_loss():
         mx.eval(loss, loss_B, state)
     assert loss_B.shape == (8,)
     assert loss.item() < first.item() - 0.5
+
+
+def test_embedding_and_head_start_equal_and_train_separately():
+    mx.random.seed(0)
+    model = GPT(CFG)
+    assert model.lm_head.weight.shape == (CFG.vocab_size, CFG.n_embd)
+    assert "bias" not in model.lm_head
+    assert mx.array_equal(model.wte.weight, model.lm_head.weight).item()
+    opt_cfg = SimpleNamespace(learning_rate=3e-3, beta2=0.95, weight_decay=1e-4)
+    optimizer = make_optimizer(opt_cfg)
+    step, state = make_train_step(model, optimizer)
+    x, y, _ = SyntheticTasksSampler("train", 16, k=2, vocab=CFG.vocab_size).get_batch(np.array([2, 2]), 4)
+    mx.eval(step(mx.array(x), mx.array(y)), state)
+    assert not mx.array_equal(model.wte.weight, model.lm_head.weight).item()
 
 
 def test_synthetic_sampler_batches():

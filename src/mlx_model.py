@@ -1,5 +1,5 @@
-# MLX port of src/model.py, for training small models on the Mac GPU. same architecture: tied embedding,
-# interleaved rotary embeddings, QK LayerNorm, SwiGLU and weightless RMSNorm. no dropout and no mup
+# MLX port of src/model.py, for training small models on the Mac GPU. same architecture: separate embedding
+# and output matrices that start from the same values (untied, shared init), interleaved rotary embeddings, QK LayerNorm, SwiGLU and weightless RMSNorm. no dropout and no mup
 import math
 from functools import partial
 
@@ -74,6 +74,9 @@ class GPT(nn.Module):
         assert config.dropout == 0.0 and not config.mup, "the mlx port has no dropout or mup"
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         self.wte.weight = mx.random.normal((config.vocab_size, config.n_embd)) / math.sqrt(config.n_embd)
+        # own parameter initialised as a copy of wte, like src/model.py: the two get separate updates and diverge
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head.weight = mx.array(self.wte.weight)
         self.blocks = [Block(config.n_embd, config.n_head) for _ in range(config.n_layer)]
         self.ln_f = RMSNorm(eps=1e-5)
 
@@ -81,11 +84,13 @@ class GPT(nn.Module):
         x_BxTxD = self.wte(x_BxT)
         for block in self.blocks:
             x_BxTxD = block(x_BxTxD)
-        return self.wte.as_linear(self.ln_f(x_BxTxD))  # shared embed and final weights
+        return self.lm_head(self.ln_f(x_BxTxD))
 
 
 def count_params(model):
-    return sum(v.size for _, v in tree_flatten(model.parameters()))
+    # non-embedding count, as in src/model.py: total minus one vocab matrix
+    tot = sum(v.size for _, v in tree_flatten(model.parameters()))
+    return tot - model.lm_head.weight.size
 
 
 def loss_fn(model, x_BxT, y_BxT):

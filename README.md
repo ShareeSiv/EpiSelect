@@ -62,6 +62,8 @@ python scripts/train_mlx.py sampler=synthetic  # no data on disk: bigram stand-i
 
 Each run writes `metrics.jsonl` (per-domain `val_loss/task{i}`, `val_balanced_loss`, `val_worst_loss`, the selector's metrics), `run_info.json` (domain names), `fit_data_{step}.npz` from each refit, and the final weights. Matmuls run in TF32 by default (`tf32: false` for full fp32, ~1.9x slower).
 
+Like `src/model.py`, the MLX model has separate input embedding and output (`lm_head`) matrices that start from the same values and are updated independently. MLX results from before this change used tied embeddings (one shared matrix), so they are not directly comparable with newer runs.
+
 To compare the paper's joint fit (`src/scaling_law_paper.py`, from the initial commit) with the own-weight-1 fit on a run's refits, fitting on the first 50% / 70% of each curve and predicting the rest:
 
 ```bash
