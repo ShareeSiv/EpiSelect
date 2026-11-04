@@ -2,13 +2,7 @@ import os
 
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=2")
 
-from types import SimpleNamespace  # noqa: E402
-
-import transformers  # noqa: E402
-
-# common_pile_grouped loads the tokenizer at import; only eos_token_id is used, so keep the test offline
-transformers.AutoTokenizer.from_pretrained = lambda *a, **k: SimpleNamespace(eos_token_id=0)
-
+# the tokenizer download is stubbed in tests/conftest.py
 import jax  # noqa: E402
 import numpy as np  # noqa: E402
 import optax  # noqa: E402

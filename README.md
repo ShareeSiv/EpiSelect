@@ -70,8 +70,8 @@ runs the paper's fit on the same hardware.
    export WANDB_API_KEY=...
    MICRO_BS=32 bash scripts/gpu/launch_124M.sh /data/commonpile_tfds /data/runs/124M_EpiSelect_own
    ```
-   `MICRO_BS` is the sequences per forward and backward pass: 32 for 80 GB, 16 for 24-48 GB (halve it on an
-   out-of-memory error). Gradient accumulation makes up the rest, so every step is still 256 sequences with the same
+   `MICRO_BS` is the sequences per forward and backward pass. By default it's set from the GPU's memory: 32 for
+   80 GB, 16 for 40-48 GB, 8 for 24-32 GB (halve it on an out-of-memory error). Gradient accumulation makes up the rest, so every step is still 256 sequences with the same
    domain draws. The val set stays at the paper's 150 x 256 sequences (`eval_batch_size`). Only the last 3
    checkpoints are kept, and the final weights go to `model.pt`. Throughput is logged as `perf/tps`.
 3. **Score it on Table 1's ten tasks** (`configs/eval.yaml`; the ARC column is ARC-Challenge), then copy the run
@@ -82,6 +82,38 @@ runs the paper's fit on the same hardware.
    bash scripts/gpu/sync.sh /data/runs <remote>
    ```
    Table 1's 124M averages: EpiSelect 0.394, ADO 0.379, Natural 0.377.
+
+### Renting on Vast.ai from your own machine
+
+`scripts/vast/vast.py` uses the `vastai` Python SDK to rent the GPU and run the whole job on it. On the
+instance, `scripts/vast/pipeline.sh` sets up, gets the data, trains, scores Table 1's tasks and uploads the run,
+writing each stage to `/workspace/STATUS`.
+
+```bash
+pip install vastai                                  # or: uv pip install -e ".[vast]"
+export VAST_API_KEY=...                             # https://console.vast.ai/manage-keys/
+vastai create ssh-key ~/.ssh/id_ed25519.pub         # once; status, fetch and watch use ssh
+export WANDB_API_KEY=...                            # forwarded to the instance
+python scripts/vast/vast.py offers                  # suitable on-demand GPUs, cheapest estimated total first
+python scripts/vast/vast.py launch OFFER_ID --data-src r2:bucket/commonpile_tfds
+python scripts/vast/vast.py status                  # stage, training progress, $ so far
+python scripts/vast/vast.py watch --destroy         # when DONE: copy the run to ./vast_runs, then destroy
+```
+
+- `offers` filters for 1 GPU, Ampere or newer, a CUDA >= 12.6 driver, reliability >= 0.98, >= 200 GB disk and fast
+  download. The cost column comes from guessed tokens/s per GPU (`TPS_GUESS` in `vast.py`). Replace the guesses with
+  your measured `perf/tps`.
+- `launch` always rents on-demand, never interruptible. The instance clones this branch at your pushed `HEAD` and
+  runs the pipeline. A restarted container picks it up again, and a finished run is left alone.
+- **Data:** with `--data-src`, the instance pulls the tokenized data from an rclone remote, `s3://` or `gs://`.
+  The `RCLONE_CONFIG_*` and `AWS_*` variables in your shell are forwarded. Without it, the instance tokenizes the
+  data itself, which takes about 1-2 extra GPU-hours (`offers --build-data` adds that to the estimate).
+- `--results-dst` uploads the run directory when it's done. Otherwise use `fetch` or `watch`. `--overrides` passes
+  hydra overrides, e.g. `"loader.fit_method=paper"` for the paper's fit with `--run-name 124M_EpiSelect_paper`.
+- **Billing doesn't stop by itself.** The instance keeps billing after `DONE` until it's destroyed. Run
+  `watch --destroy` (your machine must stay on), or `destroy` by hand.
+- The forwarded keys (W&B, HF, storage) are stored in the instance's environment, which the host can read. Use
+  scoped or temporary keys.
 
 Before renting:
 - **Use an on-demand (non-interruptible) instance.** A restart resumes the model and optimizer, but not the selector's

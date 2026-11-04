@@ -7,23 +7,8 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 from types import SimpleNamespace  # noqa: E402
 
 import pytest  # noqa: E402
-import transformers  # noqa: E402
 
-torch = pytest.importorskip("torch")
-import src.torch_model  # noqa: E402, F401  before tensorflow (see the triton note there)
-
-
-class _StubTokenizer(SimpleNamespace):
-    # offline stand-in for the gpt-neox tokenizer: one token per character
-    eos_token_id = 0
-    eos_token = "\0"
-    padding_side = "right"
-
-    def encode(self, s, **kwargs):
-        return [1 + (ord(c) % 60) for c in s]
-
-
-transformers.AutoTokenizer.from_pretrained = lambda *a, **k: _StubTokenizer()
+torch = pytest.importorskip("torch")  # triton and the tokenizer stub are set up in tests/conftest.py
 
 import equinox as eqx  # noqa: E402
 import jax  # noqa: E402

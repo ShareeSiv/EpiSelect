@@ -13,6 +13,8 @@ venv/
 .ruff_cache/
 
 # Runs and artifacts
+.vast_instance
+vast_runs/
 outputs/
 wandb/
 logs/

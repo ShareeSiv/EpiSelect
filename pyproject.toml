@@ -25,6 +25,7 @@ dependencies = [
 tpu = ["jax[tpu]>=0.6.2"]
 cuda = ["jax[cuda12]>=0.6.2"]  # the jax trainer (launch.py) on nvidia gpus
 torch = ["torch>=2.5"]  # the pytorch trainer (scripts/train_torch.py), scripts/gpu/
+vast = ["vastai>=1.10"]  # scripts/vast/vast.py, run from your own machine
 dev = ["pytest>=8.0", "ruff>=0.6"]
 bayes = ["numpyro>=0.15"]
 mlx = ["mlx>=0.30"]  # apple-silicon gpu training, scripts/train_mlx.py
