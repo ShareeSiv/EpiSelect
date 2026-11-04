@@ -17,9 +17,9 @@ evals:
   - c4       # out-of-distribution token stream
   - harness
 
+# Table 1's ten tasks. its ARC column is ARC-Challenge (0.20-0.21 at 124M; ARC-Easy scores ~0.4 at this size)
 harness_tasks:
   - arc_challenge
-  - arc_easy
   - bbq
   - boolq
   - commonsense_qa

@@ -42,29 +42,55 @@ python launch.py +experiment=124M/EpiSelect \
 ./scripts/tpu_launch.sh 124M/EpiSelect gs://your-bucket/commonpile_tfds gs://your-bucket/checkpoints
 ```
 
-## 124M on NVIDIA GPUs (Vast.ai, RunPod)
+## 124M on an NVIDIA GPU in PyTorch (Vast.ai, RunPod)
 
-`configs/experiment/124M/EpiSelect_own_nvidia.yaml` is the paper's 124M EpiSelect run (same model, the 31 Common Pile domains, seed 21, 60k steps x 256 x 1024 = 15.7B tokens, cosine schedule, refit every 1,000 steps) with the own-weight-1 fit, on one GPU host. `loader.fit_method=paper` runs the paper's fit on the same hardware.
+`scripts/train_torch.py` trains the paper's Table 1 124M EpiSelect run in PyTorch on one GPU, with the own-weight-1 fit
+(`configs/experiment/124M/EpiSelect_own_nvidia.yaml`). It uses the JAX path's configs, loaders, data selectors and
+validation set. Seed 21, 60k steps x 256 x 1024 = 15.7B tokens, AdamW (lr 1e-3, beta2 0.95, weight decay 1e-4),
+500 warm-up steps and cosine decay to 1e-5, refit every 1,000 steps (Appendix E.1). `loader.fit_method=paper`
+runs the paper's fit on the same hardware.
 
-1. **Tokenize once, off the GPU box.** The tfds build stores GPT-NeoX-20B token ids as int32, so training never tokenizes. Build on a cheap many-core CPU instance and push it to storage:
+- **Same model:** `src/torch_model.py` ports `src/model.py`. The initial weights come from the JAX model for the
+  same seed, so the init is the paper's. As in the Equinox model, the embedding and output head start from the same
+  matrix but are separate parameters that train independently. Tests check the forward pass, the optimizer update,
+  harness scoring and the full loop against the JAX code (`tests/test_torch_port.py`).
+- **Faster:** flash attention through `scaled_dot_product_attention`, `torch.compile`, bf16 autocast, fused AdamW, and
+  no activation recompute. JAX stays on the CPU, where it builds the init and runs the selector's scaling-law fits.
+
+1. **Tokenize once, off the GPU box.** The tfds build stores GPT-NeoX-20B token ids as int32, so training never
+   tokenizes. Build on a cheap many-core CPU instance and push the result to storage:
    ```bash
    bash requirements.sh && bash scripts/gpu/build_data.sh /data/commonpile_tfds 16
    bash scripts/gpu/sync.sh /data/commonpile_tfds r2:bucket/commonpile_tfds   # local, gs://, s3:// or any rclone remote
    ```
-2. **On the GPU box** (needs a CUDA 12 driver and ~250 GB disk: 95 GB of data plus checkpoints):
+2. **On the GPU box** (CUDA >= 12.6 driver, Ampere or newer, ~150 GB disk):
    ```bash
-   bash scripts/gpu/setup.sh
+   bash scripts/gpu/setup.sh          # picks the PyTorch build for the driver's CUDA version
    bash scripts/gpu/sync.sh r2:bucket/commonpile_tfds /data/commonpile_tfds
    export WANDB_API_KEY=...
    MICRO_BS=32 bash scripts/gpu/launch_124M.sh /data/commonpile_tfds /data/runs/124M_EpiSelect_own
    ```
-   `MICRO_BS` is the sequences each GPU processes per forward and backward pass: 32 for 80 GB, 16 for 40-48 GB, 8 for 24 GB. The script uses gradient accumulation to make up the rest, so every step is still 256 sequences, and the domain draws are the same for any GPU count. The val set stays at the paper's 150 x 256 sequences (`eval_batch_size`), evaluated in chunks of `eval_microbatch`. Only the last 3 checkpoints are kept (`ckpt_max_to_keep`). Each one is about 1.5 GB.
-3. Copy the run back: `bash scripts/gpu/sync.sh /data/runs/124M_EpiSelect_own <remote>`. It holds the checkpoints, `fit_data_*.npz` for `scripts/compare_fits.py` and `token_stats.json`.
+   `MICRO_BS` is the sequences per forward and backward pass: 32 for 80 GB, 16 for 24-48 GB (halve it on an
+   out-of-memory error). Gradient accumulation makes up the rest, so every step is still 256 sequences with the same
+   domain draws. The val set stays at the paper's 150 x 256 sequences (`eval_batch_size`). Only the last 3
+   checkpoints are kept, and the final weights go to `model.pt`. Throughput is logged as `perf/tps`.
+3. **Score it on Table 1's ten tasks** (`configs/eval.yaml`; the ARC column is ARC-Challenge), then copy the run
+   back:
+   ```bash
+   .venv/bin/python scripts/eval_torch.py 'runs=[{label: EpiSelect_own, path: /data/runs/124M_EpiSelect_own}]' \
+     data_dir=/data/commonpile_tfds evals=[val,harness] output=/data/runs/eval_results.json
+   bash scripts/gpu/sync.sh /data/runs <remote>
+   ```
+   Table 1's 124M averages: EpiSelect 0.394, ADO 0.379, Natural 0.377.
 
-Things to know before renting:
-- **Use an on-demand (non-interruptible) instance.** Resuming restores the model and optimizer, but not the selector's loss history or the data iterators. After a restart, EpiSelect refits on a fresh history, so a resumed run no longer matches an uninterrupted one.
-- Seed 21 makes the initialization identical to the paper's, because JAX's threefry RNG is platform-independent. The run is not bit-identical, because GPU kernels and bf16 rounding differ from TPU, and the paper's run sharded the tf.data streams across TPU hosts. Expect a close match, not an exact one, and compare against `fit_method=paper` on the same GPUs for a like-for-like difference.
-- bf16 compute needs an Ampere or newer GPU (A100, A6000, L40S, RTX 3090/4090, H100).
+Before renting:
+- **Use an on-demand (non-interruptible) instance.** A restart resumes the model and optimizer, but not the selector's
+  loss history or the data streams. EpiSelect then refits on a fresh history, so a resumed run no longer matches an
+  uninterrupted one.
+- The run will be close to the paper's but not bit-identical. The init is the same, but GPU kernels and bf16
+  rounding differ from TPU, the paper's tf.data streams were split across 4 TPU hosts, and the shuffle buffers are
+  unseeded. Compare against `fit_method=paper` on the same GPU for a like-for-like difference.
+- `launch.py` with `requirements.sh cuda` still runs the JAX trainer on NVIDIA GPUs (any count), but it is slower.
 
 ## Small models on a Mac (MLX)
 

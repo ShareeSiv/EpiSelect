@@ -1,7 +1,7 @@
 # @package _global_
-# The paper's 124M EpiSelect run (same model, data, seed and schedule) with the own-weight-1 fit,
-# on a single NVIDIA host. Launch with scripts/gpu/launch_124M.sh, which sets batch_size and
-# g_accum_iters from the GPU count so every step still sees 256 x 1024 tokens.
+# The paper's 124M EpiSelect run (Table 1; Appendix E.1: same model, data, seed, optimizer and schedule) with the
+# own-weight-1 fit, trained in PyTorch on one NVIDIA GPU by scripts/train_torch.py. Launch with
+# scripts/gpu/launch_124M.sh, which splits each step's 256 sequences into microbatches that fit the GPU.
 # The paper's fit on the same hardware, for a like-for-like baseline: loader.fit_method=paper
 defaults:
   - override /model: 124M
@@ -11,7 +11,8 @@ tag: 124M-run-NVIDIA
 multihost: false
 
 eval_batch_size: 256  # the paper's val set (150 x 256 sequences), whatever batch_size is
-ckpt_max_to_keep: 3   # each checkpoint is ~1.5 GB (params + adam); every one would be ~90 GB
+ckpt_max_to_keep: 3   # each checkpoint is ~2 GB (params + adam state)
+compile: true         # torch.compile the forward and loss
 
 loader:
   fit_method: own
