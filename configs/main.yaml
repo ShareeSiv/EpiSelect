@@ -23,10 +23,7 @@ wsd_decay_frac: 0.2  # wsd: fraction of max_steps spent decaying at the end
 
 batch_size: 256  # global across all devices
 block_size: 1024
-g_accum_iters: 1  # sequences per step = batch_size x g_accum_iters
-eval_batch_size: null  # val batch, defaults to batch_size; 150 batches of it form the val set
-eval_microbatch: null  # val forward-pass chunk (null = the whole batch), to bound gpu memory
-ckpt_max_to_keep: null  # null keeps every checkpoint (one per eval_interval)
+g_accum_iters: 1
 param_dtype: float32
 compute_dtype: bfloat16
 shard_model: false

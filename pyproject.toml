@@ -23,7 +23,6 @@ dependencies = [
 
 [project.optional-dependencies]
 tpu = ["jax[tpu]>=0.6.2"]
-cuda = ["jax[cuda12]>=0.6.2"]  # nvidia gpus, scripts/gpu/
 dev = ["pytest>=8.0", "ruff>=0.6"]
 bayes = ["numpyro>=0.15"]
 mlx = ["mlx>=0.30"]  # apple-silicon gpu training, scripts/train_mlx.py

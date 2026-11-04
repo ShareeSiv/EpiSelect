@@ -2,7 +2,6 @@
 # Create a local virtualenv and install EpiSelect with its dependencies.
 #   bash requirements.sh        # dev install, CPU jax (pulled in by equinox/optax)
 #   bash requirements.sh tpu    # dev install + jax[tpu]
-#   bash requirements.sh cuda   # dev install + jax[cuda12] (nvidia gpus, see scripts/gpu/)
 # On a TPU VM use scripts/tpu_setup.sh instead — it provisions the host as well.
 set -euo pipefail
 
@@ -11,8 +10,6 @@ cd "$(dirname "$0")"
 EXTRAS=dev
 if [[ "${1:-}" == "tpu" ]]; then
   EXTRAS=dev,tpu
-elif [[ "${1:-}" == "cuda" ]]; then
-  EXTRAS=dev,cuda
 fi
 
 if command -v uv >/dev/null 2>&1; then
